@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import glob
 import json
@@ -6,6 +7,7 @@ from env import ClashRoyaleEnv
 from dqn_agent import DQNAgent
 from pynput import keyboard
 from datetime import datetime
+from Actions import Actions  # NEW
 
 class KeyboardController:
     def __init__(self):
@@ -20,7 +22,7 @@ class KeyboardController:
                 self.should_exit = True
         except AttributeError:
             pass  # Special key pressed
-            
+
     def is_exit_requested(self):
         return self.should_exit
 
@@ -34,6 +36,7 @@ def get_latest_model_path(models_dir="models"):
 def train():
     env = ClashRoyaleEnv()
     agent = DQNAgent(env.state_size, env.action_size)
+    actions = Actions()  # NEW
 
     # Ensure models directory exists
     os.makedirs("models", exist_ok=True)
@@ -54,15 +57,23 @@ def train():
     episodes = 10000
     batch_size = 32
 
+    # carry flag from previous episode if we used Play Again
+    prev_used_play_again = False
+
     for ep in range(episodes):
         if controller.is_exit_requested():
             print("Training interrupted by user.")
             break
 
+        # If last episode already queued the next match via Play Again, let it load a bit
+        if prev_used_play_again:
+            time.sleep(2.0)  # small settle to avoid double-queue races
+
         state = env.reset()
-        print(f"Episode {ep + 1} starting. Epsilon: {agent.epsilon:.3f}")  # <-- Add this line
+        print(f"Episode {ep + 1} starting. Epsilon: {agent.epsilon:.3f}")
         total_reward = 0
         done = False
+
         while not done:
             action = agent.act(state)
             next_state, reward, done = env.step(action)
@@ -70,6 +81,18 @@ def train():
             agent.replay(batch_size)
             state = next_state
             total_reward += reward
+
+        # Try Trophy Road Play Again right after match end
+        used_play_again = False
+        try:
+            if actions.click_play_again_trophyroad(timeout=3.0):
+                used_play_again = True
+                time.sleep(1.0)  # allow transition
+        except Exception as e:
+            print(f"Play Again attempt failed: {e}")
+
+        prev_used_play_again = used_play_again
+
         print(f"Episode {ep + 1}: Total Reward = {total_reward:.2f}, Epsilon = {agent.epsilon:.3f}")
 
         if ep % 10 == 0:
