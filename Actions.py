@@ -21,7 +21,7 @@ class Actions:
             self.WIDTH = self.BOTTOM_RIGHT_X - self.TOP_LEFT_X
             self.HEIGHT = self.BOTTOM_RIGHT_Y - self.TOP_LEFT_Y
 
-            # Safe defaults for card bar on mac (not used if you don't need it)
+            # Safe defaults for card bar on mac
             self.CARD_BAR_X = self.TOP_LEFT_X
             self.CARD_BAR_Y = self.TOP_LEFT_Y + int(self.HEIGHT * 0.80)
             self.CARD_BAR_WIDTH = self.WIDTH
@@ -186,68 +186,89 @@ class Actions:
     # -------------------------
     # Post-battle helpers
     # -------------------------
-    def _bottom_center_roi(self, w_ratio=0.60, y_from=0.65, y_to=0.95):
-        """
-        ROI inside the game window for bottom-center UI buttons like Play Again.
-        Returns region=(left, top, width, height) in screen coords for locateOnScreen.
-        """
-        W = self.WIDTH
-        H = self.HEIGHT
-
-        roi_w = int(W * w_ratio)
-        x0_rel = (W - roi_w) // 2
-        x0 = self.TOP_LEFT_X + x0_rel
-        y0 = self.TOP_LEFT_Y + int(H * y_from)
-        roi_h = int(H * (y_to - y_from))
-        return (x0, y0, roi_w, roi_h)
-
     def _click_center_bottom_fallback(self):
         """
         Safe fallback click near expected Play Again area for Trophy Road.
         """
-        x = self.TOP_LEFT_X + self.WIDTH // 2
-        y = self.TOP_LEFT_Y + int(self.HEIGHT * 0.86)
+        # For Windows: button is well below field area; use card-bar anchor
+        if self.os_type == "Windows":
+            x = self.CARD_BAR_X + self.CARD_BAR_WIDTH // 2
+            y = self.CARD_BAR_Y - 40  # just above the card bar
+        else:
+            # macOS: center-bottom of field area
+            x = self.TOP_LEFT_X + self.WIDTH // 2
+            y = self.TOP_LEFT_Y + int(self.HEIGHT * 0.86)
         print(f"Fallback click at ({x}, {y})")
         pyautogui.moveTo(x, y, duration=0.15)
         pyautogui.click()
 
     def click_play_again_trophyroad(self, timeout=3.0):
         """
-        Robust Trophy Road Play Again click:
-        - Searches for template(s) inside a bottom-center ROI of the game window
-        - Falls back to a safe relative click if template not found
+        Look for Play Again in a bottom-of-window ROI built around the card bar.
+        Falls back to a safe center-bottom click if not found.
         """
-        # You can provide both normal and alt templates if UI theme varies
+        # Templates to try
         candidates = [
             os.path.join(self.images_folder, "play_again_trophyroad.png"),
-            os.path.join(self.images_folder, "play_again.png"),  # optional backup if present
+            os.path.join(self.images_folder, "play_again.png"),
         ]
-        # Filter to existing files
         templates = [p for p in candidates if os.path.isfile(p)]
+
+        # --- Build a bottom-of-window ROI ---
+        if self.os_type == "Windows":
+            # Expand around the known card bar box (covers ~800–1000px Y)
+            x0 = max(self.CARD_BAR_X - 140, 0)
+            y0 = max(self.CARD_BAR_Y - 160, 0)
+            w  = self.CARD_BAR_WIDTH + 280
+            h  = self.CARD_BAR_HEIGHT + 280
+            playagain_region = (x0, y0, w, h)
+        else:
+            # macOS: take bottom 35% of the game window width-centered
+            W, H = self.WIDTH, self.HEIGHT
+            roi_w = int(W * 0.70)
+            rx0 = self.TOP_LEFT_X + (W - roi_w) // 2
+            ry0 = self.TOP_LEFT_Y + int(H * 0.60)
+            roi_h = int(H * 0.35)
+            playagain_region = (rx0, ry0, roi_w, roi_h)
+
+        confidences = [0.90, 0.86, 0.82, 0.78]
+        t0 = time.time()
+
+        # Quick path: if no templates, just fallback-click
         if not templates:
             print("No play-again templates found. Using fallback.")
             self._click_center_bottom_fallback()
             return True
 
-        roi = self._bottom_center_roi(w_ratio=0.60, y_from=0.65, y_to=0.95)
-        confidences = [0.88, 0.84, 0.80]
-
-        t0 = time.time()
         while time.time() - t0 < timeout:
             for tpl in templates:
                 for conf in confidences:
                     try:
-                        loc = pyautogui.locateOnScreen(tpl, confidence=conf, region=roi)
+                        loc = pyautogui.locateOnScreen(
+                            tpl, confidence=conf, region=playagain_region, grayscale=True
+                        )
                     except Exception as e:
                         print(f"locateOnScreen error: {e}")
                         loc = None
                     if loc:
                         x, y = pyautogui.center(loc)
-                        print(f"Play Again matched at ({x}, {y}) with conf {conf} using {os.path.basename(tpl)}")
-                        pyautogui.moveTo(x, y, duration=0.15)
+                        print(f"Play Again matched at ({x}, {y}) conf={conf} tpl={os.path.basename(tpl)}")
+                        pyautogui.moveTo(x, y, duration=0.12)
                         pyautogui.click()
                         return True
-            time.sleep(0.15)
+            time.sleep(0.12)
+
+        # Debug dump of the ROI so you can verify we’re looking in the right place
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dbg_dir = os.path.join(self.script_dir, "screenshots")
+            os.makedirs(dbg_dir, exist_ok=True)
+            rx, ry, rw, rh = playagain_region
+            snap = pyautogui.screenshot(region=(rx, ry, rw, rh))
+            snap.save(os.path.join(dbg_dir, f"debug_playagain_roi_{ts}.png"))
+            print(f"Saved ROI debug to screenshots/debug_playagain_roi_{ts}.png")
+        except Exception as e:
+            print(f"Failed to save ROI debug: {e}")
 
         print("Play Again not found by template. Using fallback.")
         self._click_center_bottom_fallback()
@@ -259,7 +280,6 @@ class Actions:
     def detect_game_end(self):
         """
         Detect end screen, decide victory/defeat, then click Play Again for Trophy Road.
-        Replaced fixed coords with ROI template matching.
         """
         try:
             winner_img = os.path.join(self.images_folder, "Winner.png")
@@ -278,6 +298,7 @@ class Actions:
                         winner_img, confidence=confidence, grayscale=True, region=winner_region
                     )
                 except Exception as e:
+                    # Noisy but harmless; comment out if spammy
                     print(f"Error locating Winner: {str(e)}")
 
                 if winner_location:
