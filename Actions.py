@@ -126,10 +126,10 @@ class Actions:
             time.sleep(1)
 
     # ---------- Minimal post-battle: periodic '1' ----------
-    def press_play_again_keyburst(self, repeats=3, delay=0.25, key='1'):
-        """
-        Press key '1' a few times. You said '1' triggers Play Again.
-        """
+    def press_play_again_keyburst(self, repeats=1, delay=0.25, keys=('1', 'b', 'n')):
+        """Press multiple keys in a burst (like '1' and 'b')."""
         for _ in range(repeats):
-            pyautogui.press(key)
-            time.sleep(delay)
+            for key in keys:
+                pyautogui.press(key)
+                time.sleep(delay)
+
