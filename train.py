@@ -11,7 +11,12 @@ from dqn_agent import DQNAgent
 
 # Autonomy bits
 from window_helper import align_and_get_bbox
-from vision import screenshot_region, has_winner_text, find_play_again_center
+from vision import (
+    screenshot_region,
+    has_winner_text,
+    find_play_again_center,
+    assert_tesseract_ready,
+)
 from logger import write_match
 
 # ---- config
@@ -57,10 +62,14 @@ def start_endgame_watcher(bbox):
 
     def _watch():
         while not stop_evt.is_set():
-            img = screenshot_region(bbox)
-            if has_winner_text(img):
-                finished_evt.set()
-                return
+            try:
+                img = screenshot_region(bbox)
+                if has_winner_text(img):
+                    finished_evt.set()
+                    return
+            except Exception as e:
+                # Never kill the thread on OCR issues
+                print(f"OCR watch error: {e}")
             time.sleep(CHECK_INTERVAL)
 
     t = threading.Thread(target=_watch, daemon=True)
@@ -95,6 +104,9 @@ def end_episode_cleanly(bbox):
 
 # ---- main loop
 def train():
+    # Fail fast if Tesseract isn’t reachable
+    assert_tesseract_ready()
+
     env = ClashRoyaleEnv()
     agent = DQNAgent(env.state_size, env.action_size)
     load_latest(agent)

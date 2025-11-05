@@ -2,6 +2,8 @@ import pyautogui
 import os
 import time
 import platform
+from pathlib import Path
+from io import BytesIO
 
 class Actions:
     def __init__(self):
@@ -44,14 +46,31 @@ class Actions:
         self.card_keys = {0: '1', 1: '2', 2: '3', 3: '4'}
         self.current_card_positions = {}
 
-    # ---------- Captures (unchanged, optional) ----------
+    # ---------- internal: robust image save ----------
+    def _safe_save(self, img, save_path: str):
+        """
+        Robust PNG save that avoids PIL fileno issues on Windows.
+        Always writes a materialized RGBA copy and falls back to BytesIO.
+        """
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            img = img.convert("RGBA").copy()
+            img.save(str(p), format="PNG")
+        except Exception:
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            with open(p, "wb") as f:
+                f.write(buf.getvalue())
+
+    # ---------- Captures (patched to use _safe_save) ----------
     def capture_area(self, save_path):
         screenshot = pyautogui.screenshot(region=(self.TOP_LEFT_X, self.TOP_LEFT_Y, self.WIDTH, self.HEIGHT))
-        screenshot.save(save_path)
+        self._safe_save(screenshot, save_path)
 
     def capture_card_area(self, save_path):
         screenshot = pyautogui.screenshot(region=(self.CARD_BAR_X, self.CARD_BAR_Y, self.CARD_BAR_WIDTH, self.CARD_BAR_HEIGHT))
-        screenshot.save(save_path)
+        self._safe_save(screenshot, save_path)
 
     def capture_individual_cards(self):
         screenshot = pyautogui.screenshot(region=(self.CARD_BAR_X, self.CARD_BAR_Y, self.CARD_BAR_WIDTH, self.CARD_BAR_HEIGHT))
@@ -61,8 +80,7 @@ class Actions:
             left = i * card_width
             card_img = screenshot.crop((left, 0, left + card_width, self.CARD_BAR_HEIGHT))
             save_path = os.path.join(self.script_dir, 'screenshots', f"card_{i+1}.png")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            card_img.save(save_path)
+            self._safe_save(card_img, save_path)
             cards.append(save_path)
         return cards
 
@@ -125,11 +143,10 @@ class Actions:
             pyautogui.click()
             time.sleep(1)
 
-    # ---------- Minimal post-battle: periodic '1' ----------
+    # ---------- Minimal post-battle: periodic '1' (kept for now; unused in our loop) ----------
     def press_play_again_keyburst(self, repeats=1, delay=0.25, keys=('1', 'b', 'n')):
         """Press multiple keys in a burst (like '1' and 'b')."""
         for _ in range(repeats):
             for key in keys:
                 pyautogui.press(key)
                 time.sleep(delay)
-
