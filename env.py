@@ -1,16 +1,16 @@
-import re
-import numpy as np
-import time
 import os
-import pyautogui
+import re
+import time
 import threading
+import numpy as np
+import pyautogui
 from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 
-# Optional: set Tesseract exe via env if not on PATH
+# Optional: set Tesseract path via env if not on PATH
 TESSERACT_EXE = os.getenv("TESSERACT_EXE")
 if TESSERACT_EXE and os.path.isfile(TESSERACT_EXE):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
@@ -20,6 +20,12 @@ load_dotenv()
 MAX_ENEMIES = 10
 MAX_ALLIES  = 10
 SPELL_CARDS = ["Fireball", "Zap", "Arrows", "Tornado", "Rocket", "Lightning", "Freeze"]
+
+DEBUG_DIR = os.path.join(os.path.dirname(__file__), "debug")
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+def _nc(s):
+    return s.strip().lower() if isinstance(s, str) else ""
 
 class ClashRoyaleEnv:
     def __init__(self):
@@ -33,6 +39,8 @@ class ClashRoyaleEnv:
         self.grid_height = 28
 
         self.screenshot_path = os.path.join(os.path.dirname(__file__), 'screenshots', "current.png")
+        os.makedirs(os.path.dirname(self.screenshot_path), exist_ok=True)
+
         self.available_actions = self.get_available_actions()
         self.action_size = len(self.available_actions)
         self.current_cards = []
@@ -52,16 +60,9 @@ class ClashRoyaleEnv:
         self._last_enemy  = []
         self._last_elixir = None
 
-        # Tower HP caches (current nums and max nums detected this match)
-        self._tower_hp_curr = {
-            "ally":  {"king": None, "princess_left": None, "princess_right": None},
-            "enemy": {"king": None, "princess_left": None, "princess_right": None},
-        }
-        self._tower_hp_max = {
-            "ally":  {"king": None, "princess_left": None, "princess_right": None},
-            "enemy": {"king": None, "princess_left": None, "princess_right": None},
-        }
-        self._tower_max_initialized = False
+        # cache preds + image size for tower OCR anchoring
+        self._last_predictions = []
+        self._last_img_size = None  # (W, H)
 
     # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
@@ -93,14 +94,9 @@ class ClashRoyaleEnv:
         self._last_enemy = []
         self._last_elixir = None
 
-        for side in ("ally","enemy"):
-            for slot in ("king","princess_left","princess_right"):
-                self._tower_hp_curr[side][slot] = None
-                self._tower_hp_max[side][slot] = None
-        self._tower_max_initialized = False
+        self._last_predictions = []
+        self._last_img_size = None
 
-        # Try to capture initial max HPs at game start
-        self._prime_tower_max_hp()
         return self._get_state()
 
     def close(self):
@@ -155,7 +151,6 @@ class ClashRoyaleEnv:
 
     # ---------------- State construction ----------------
     def _get_state(self):
-        # Always refresh frame and attempt OCR so UI keeps updating
         self.actions.capture_area(self.screenshot_path)
         elixir = self.actions.count_elixir()
         self._last_elixir = int(elixir) if elixir is not None else None
@@ -178,27 +173,32 @@ class ClashRoyaleEnv:
             if isinstance(first, dict) and "predictions" in first:
                 predictions = first["predictions"]
 
-        # Update tower HP every state tick (uses preds or fallback ROIs)
+        # cache for tower OCR
+        self._last_predictions = predictions or []
         try:
-            self._update_tower_hp_from_ocr(predictions)
+            with Image.open(self.screenshot_path) as im:
+                self._last_img_size = im.size  # (W, H)
         except Exception:
-            pass
+            self._last_img_size = (self.actions.WIDTH, self.actions.HEIGHT)
 
+        # Build state vectors
         if not predictions:
             ally_flat = [0.0] * (2 * MAX_ALLIES)
             enemy_flat = [0.0] * (2 * MAX_ENEMIES)
             return np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
 
-        def nc(s): return s.strip().lower() if isinstance(s, str) else ""
         TOWERS = {"ally king tower","ally princess tower","enemy king tower","enemy princess tower"}
 
         allies, enemies, enemy_names = [], [], []
         for p in predictions:
-            if not isinstance(p, dict): continue
-            cls_raw = p.get("class",""); cls = nc(cls_raw)
-            if cls in TOWERS: continue
+            if not isinstance(p, dict): 
+                continue
+            cls_raw = p.get("class",""); cls = _nc(cls_raw)
+            if cls in TOWERS: 
+                continue
             x = p.get("x"); y = p.get("y")
-            if x is None or y is None: continue
+            if x is None or y is None: 
+                continue
             if cls.startswith("ally"):
                 allies.append((x,y))
             elif cls.startswith("enemy"):
@@ -210,145 +210,198 @@ class ClashRoyaleEnv:
 
         self._last_enemy = enemy_names
 
-        def norm(units): return [(x / self.actions.WIDTH, y / self.actions.HEIGHT) for x,y in units]
+        def norm(units): 
+            return [(x / self.actions.WIDTH, y / self.actions.HEIGHT) for x,y in units]
         def pad(units, n):
             units = norm(units)
-            if len(units) < n: units += [(0.0,0.0)] * (n - len(units))
+            if len(units) < n: 
+                units += [(0.0,0.0)] * (n - len(units))
             return units[:n]
 
         ally_flat  = [c for pos in pad(allies, MAX_ALLIES)  for c in pos]
         enemy_flat = [c for pos in pad(enemies, MAX_ENEMIES) for c in pos]
         return np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
 
-    # ---------------- Tower OCR ----------------
-    def _prime_tower_max_hp(self):
-        for _ in range(4):
-            try:
-                self.actions.capture_area(self.screenshot_path)
-                ws = os.getenv('WORKSPACE_TROOP_DETECTION')
-                res = self.rf_model.run_workflow(
-                    workspace_name=ws,
-                    workflow_id="detect-count-and-visualize",
-                    images={"image": self.screenshot_path}
-                )
-                preds = []
-                if isinstance(res, dict) and "predictions" in res:
-                    preds = res["predictions"]
-                elif isinstance(res, list) and res and isinstance(res[0], dict) and "predictions" in res[0]:
-                    preds = res[0]["predictions"]
-                self._update_tower_hp_from_ocr(preds, init_only=True)
-                if self._tower_hp_max["ally"]["king"] and self._tower_hp_max["enemy"]["king"]:
-                    self._tower_max_initialized = True
-                    return
-            except Exception:
-                pass
-            time.sleep(0.35)
-        self._tower_max_initialized = True
+    # ---------------- Big OCR boxes anchored on tower detections ----------------
+    def _get_tower_ocr_debug(self):
+        """
+        Returns all numbers OCR'd from large boxes around each tower area, using
+        Roboflow tower detections to anchor boxes when available.
 
-    def _update_tower_hp_from_ocr(self, predictions, init_only=False):
-        if not os.path.isfile(self.screenshot_path): return
-        img = Image.open(self.screenshot_path).convert("RGB")
+        {
+          "ally":  {"princess_left":[...], "king":[...], "princess_right":[...]},
+          "enemy": {"princess_left":[...], "king":[...], "princess_right":[...]},
+        }
+        Saves crops under debug/ for inspection.
+        """
+        if not os.path.isfile(self.screenshot_path):
+            return {"ally": {}, "enemy": {}}
 
-        boxes = self._get_tower_boxes(predictions)
-        for side in ("ally","enemy"):
-            if not any(boxes[side].values()):
-                boxes[side] = self._fallback_tower_rois(img.size, side)
+        try:
+            img = Image.open(self.screenshot_path).convert("RGB")
+        except Exception:
+            return {"ally": {}, "enemy": {}}
 
-        for side in ("ally","enemy"):
-            for slot in ("princess_left","king","princess_right"):
-                box = boxes[side].get(slot)
-                if not box: continue
-                crop = self._tower_text_crop(img, box, side)
-                val = self._ocr_int(crop)
-                if val is None: continue
-                self._tower_hp_curr[side][slot] = val
-                if init_only or self._tower_hp_max[side][slot] is None:
-                    self._tower_hp_max[side][slot] = val
-                elif val > (self._tower_hp_max[side][slot] or 0):
-                    self._tower_hp_max[side][slot] = val
+        out = {"ally": {}, "enemy": {}}
 
-    def _get_tower_boxes(self, predictions):
-        def nc(s): return s.strip().lower() if isinstance(s, str) else ""
-        by = {"ally": [], "enemy": []}
+        rois_pred = self._tower_rois_from_predictions(self._last_predictions, img.size)
+        rois_fb_enemy = self._fallback_rois(img.size, "enemy")
+        rois_fb_ally  = self._fallback_rois(img.size, "ally")
+
+        rois_enemy = rois_pred.get("enemy") or rois_fb_enemy
+        rois_ally  = rois_pred.get("ally")  or rois_fb_ally
+
+        for side, rois in (("enemy", rois_enemy), ("ally", rois_ally)):
+            for slot, box in rois.items():
+                crop = img.crop(box)
+                # save crop for debugging
+                stamp = int(time.time() * 1000)
+                crop_path = os.path.join(DEBUG_DIR, f"{side}_{slot}_{stamp}.png")
+                try:
+                    crop.save(crop_path)
+                except Exception:
+                    pass
+                nums = self._ocr_all_numbers(crop)
+                out[side][slot] = nums
+
+        return out
+
+    def _tower_rois_from_predictions(self, predictions, img_size):
+        """
+        Build OCR boxes using Roboflow tower detections if present.
+        Expect:
+          ally/enemy princess tower (two each), ally/enemy king tower (one each).
+        """
+        W, H = img_size
+        L = self.actions.TOP_LEFT_X
+        T = self.actions.TOP_LEFT_Y
+        FW = self.actions.WIDTH
+        FH = self.actions.HEIGHT
+
+        ally_princess, enemy_princess = [], []
+        ally_king, enemy_king = [], []
+
         for p in predictions or []:
-            if not isinstance(p, dict): continue
-            cls = nc(p.get("class",""))
-            if cls not in ("ally king tower","ally princess tower","enemy king tower","enemy princess tower"): continue
+            if not isinstance(p, dict):
+                continue
+            cls = _nc(p.get("class",""))
             x = p.get("x"); y = p.get("y")
-            bw = int(p.get("width") or p.get("w") or 120)
-            bh = int(p.get("height") or p.get("h") or 180)
-            if x is None or y is None: continue
-            side = "ally" if cls.startswith("ally") else "enemy"
-            typ  = "king" if "king" in cls else "princess"
-            by[side].append({"type": typ, "x": int(x), "y": int(y), "w": bw, "h": bh})
+            if x is None or y is None:
+                continue
+            if cls == "ally princess tower":
+                ally_princess.append((x, y))
+            elif cls == "enemy princess tower":
+                enemy_princess.append((x, y))
+            elif cls == "ally king tower":
+                ally_king.append((x, y))
+            elif cls == "enemy king tower":
+                enemy_king.append((x, y))
 
-        def choose(arr):
-            left = None; right = None; king = None
-            for it in arr:
-                if it["type"] == "king": king = it
-                else:
-                    if left is None or it["x"] < (left["x"] if left else 10**9):
-                        left = it
-                    if right is None or it["x"] > (right["x"] if right else -10**9):
-                        right = it
-            return {"princess_left": left, "king": king, "princess_right": right}
+        def box_around(cx, cy, w_frac=0.22, h_frac=0.12, y_shift_px=0):
+            bw = max(16, int(w_frac * FW))
+            bh = max(14, int(h_frac * FH))
+            x1 = int(cx - bw // 2)
+            y1 = int(cy - bh // 2 + y_shift_px)
+            x2 = x1 + bw
+            y2 = y1 + bh
+            # clamp to field bbox
+            x1 = max(L, x1); y1 = max(T, y1)
+            x2 = min(L + FW, x2); y2 = min(T + FH, y2)
+            return (x1, y1, x2, y2)
 
-        return {"ally": choose(by["ally"]), "enemy": choose(by["enemy"])}
+        rois = {"ally": {}, "enemy": {}}
 
-    def _fallback_tower_rois(self, img_size, side):
+        # Enemy numbers are above bars
+        if enemy_king:
+            cx, cy = enemy_king[0]
+            rois["enemy"]["king"] = box_around(cx, cy, y_shift_px=-int(0.03 * FH))
+        if len(enemy_princess) >= 2:
+            enemy_princess.sort(key=lambda t: t[0])
+            (l_cx, l_cy), (r_cx, r_cy) = enemy_princess[0], enemy_princess[-1]
+            rois["enemy"]["princess_left"]  = box_around(l_cx, l_cy, y_shift_px=-int(0.03 * FH))
+            rois["enemy"]["princess_right"] = box_around(r_cx, r_cy, y_shift_px=-int(0.03 * FH))
+
+        # Ally numbers are under bars
+        if ally_king:
+            cx, cy = ally_king[0]
+            rois["ally"]["king"] = box_around(cx, cy, y_shift_px=+int(0.03 * FH))
+        if len(ally_princess) >= 2:
+            ally_princess.sort(key=lambda t: t[0])
+            (l_cx, l_cy), (r_cx, r_cy) = ally_princess[0], ally_princess[-1]
+            rois["ally"]["princess_left"]  = box_around(l_cx, l_cy, y_shift_px=+int(0.03 * FH))
+            rois["ally"]["princess_right"] = box_around(r_cx, r_cy, y_shift_px=+int(0.03 * FH))
+
+        if not rois["ally"]:
+            del rois["ally"]
+        if not rois["enemy"]:
+            del rois["enemy"]
+        return rois
+
+    def _fallback_rois(self, img_size, side):
+        """
+        Wide bands fallback when predictions missing.
+        """
         L = self.actions.TOP_LEFT_X
         T = self.actions.TOP_LEFT_Y
         W = self.actions.WIDTH
         H = self.actions.HEIGHT
 
-        xs = [L + int(0.25 * W), L + int(0.50 * W), L + int(0.75 * W)]
-        if side == "enemy":
-            ys = [T + int(0.17 * H), T + int(0.08 * H), T + int(0.17 * H)]
-        else:
-            ys = [T + int(0.86 * H), T + int(0.94 * H), T + int(0.86 * H)]
+        left_x1  = L + int(0.08 * W)
+        left_x2  = L + int(0.38 * W)
+        mid_x1   = L + int(0.38 * W)
+        mid_x2   = L + int(0.62 * W)
+        right_x1 = L + int(0.62 * W)
+        right_x2 = L + int(0.92 * W)
 
-        bw = max(100, int(0.18 * W))
-        bh = max(120, int(0.22 * H))
+        if side == "enemy":
+            y1 = T + int(0.02 * H)
+            y2 = T + int(0.24 * H)
+        else:
+            y1 = T + int(0.76 * H)
+            y2 = T + int(0.98 * H)
 
         return {
-            "princess_left":  {"x": xs[0], "y": ys[0], "w": bw, "h": bh},
-            "king":           {"x": xs[1], "y": ys[1], "w": bw, "h": bh},
-            "princess_right": {"x": xs[2], "y": ys[2], "w": bw, "h": bh},
+            "princess_left":  (left_x1,  y1, left_x2,  y2),
+            "king":           (mid_x1,   y1, mid_x2,   y2),
+            "princess_right": (right_x1, y1, right_x2, y2),
         }
 
-    def _tower_text_crop(self, img, box, side):
-        w_img, h_img = img.size
-        x = box["x"]; y = box["y"]; w = box["w"]; h = box["h"]
+    def _ocr_all_numbers(self, crop_img):
+        """
+        Return every integer detected in the crop using two passes (binarized + gray),
+        and two PSMs (7, 13). Upscales first.
+        """
+        up = crop_img.resize((int(crop_img.width * 2.5), int(crop_img.height * 2.5)), Image.BICUBIC)
+        g  = ImageOps.grayscale(up)
+        g  = ImageOps.autocontrast(g, cutoff=2)
+        g  = g.filter(ImageFilter.MedianFilter(3))
 
-        band_w = max(80, min(260, int(0.95 * w)))
-        band_h = max(18, min(42, int(0.16 * h)))
+        bin_img = g.point(lambda p: 255 if p > 140 else 0)
 
-        if side == "enemy":
-            top = y - int(0.70 * h)   # above bar
-        else:
-            top = y - int(0.38 * h)   # under bar
-
-        left = x - band_w // 2
-        right = left + band_w
-        bottom = top + band_h
-
-        left = max(0, left); top = max(0, top)
-        right = min(w_img, right); bottom = min(h_img, bottom)
-        if right - left < 10 or bottom - top < 10:
-            return None
-        return img.crop((left, top, right, bottom))
-
-    def _ocr_int(self, crop):
-        if crop is None: return None
-        g = ImageOps.grayscale(crop)
-        g = ImageOps.autocontrast(g, cutoff=2)
-        g = g.filter(ImageFilter.MedianFilter(3))
-        g = g.point(lambda p: 255 if p > 140 else 0)
-        txt = pytesseract.image_to_string(
-            g, config="--psm 7 -l eng -c tessedit_char_whitelist=0123456789"
-        )
-        m = re.search(r"(\d{2,6})", txt)
-        return int(m.group(1)) if m else None
+        nums = set()
+        for src in (bin_img, g):
+            for psm in (7, 13):
+                try:
+                    data = pytesseract.image_to_data(
+                        src,
+                        config=f"--psm {psm} -l eng -c tessedit_char_whitelist=0123456789",
+                        output_type=pytesseract.Output.DICT
+                    )
+                except Exception:
+                    continue
+                texts = data.get("text", [])
+                confs = data.get("conf", [])
+                for t, c in zip(texts, confs):
+                    if not t:
+                        continue
+                    for s in re.findall(r"\d+", t):
+                        try:
+                            cf = float(c) if not isinstance(c, str) else float(c) if c.strip() else -1.0
+                        except:
+                            cf = -1.0
+                        if cf >= 0:
+                            nums.add(int(s))
+        return sorted(nums)
 
     # ---------------- Reward ----------------
     def _compute_reward(self, state):
@@ -405,7 +458,7 @@ class ClashRoyaleEnv:
 
     # ---------------- Endgame watcher ----------------
     def _endgame_watcher(self):
-        """Don’t crash if Actions has no detect_game_end()."""
+        """Safe stub: don't crash if detect_game_end is missing."""
         while not self._endgame_thread_stop.is_set():
             try:
                 fn = getattr(self.actions, "detect_game_end", None)
@@ -445,17 +498,6 @@ class ClashRoyaleEnv:
     def get_elixir(self):
         return self._last_elixir
 
-    def get_tower_hp(self):
-        """
-        Returns percentages 0..100 (rounded client-side) or None if unknown.
-        Keys: tower_hp = { ally:{princess_left, king, princess_right}, enemy:{...} }
-        """
-        out = {"ally": {"king": None, "princess_left": None, "princess_right": None},
-               "enemy": {"king": None, "princess_left": None, "princess_right": None}}
-        for side in ("ally","enemy"):
-            for slot in ("princess_left","king","princess_right"):
-                cur = self._tower_hp_curr[side][slot]
-                mx  = self._tower_hp_max[side][slot]
-                if cur is not None and mx and mx > 0:
-                    out[side][slot] = 100.0 * (cur / mx)
-        return out
+    # tower OCR debug (public)
+    def get_tower_ocr_debug(self):
+        return self._get_tower_ocr_debug()

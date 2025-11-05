@@ -1,4 +1,4 @@
-# train.py (web UI + quiet training loop + tower HP UI)
+# train.py (web UI + quiet loop + big tower OCR lists)
 import os
 import time
 import glob
@@ -29,7 +29,7 @@ PLAY_AGAIN_RETRY_DELAY = 0.35
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ---------- in-process status store ----------
+# ---------- status ----------
 class _Status:
     def __init__(self):
         from threading import Lock
@@ -44,23 +44,26 @@ class _Status:
             "win": False,
             "play_again": False,
             "last_action": None,
-            "tower_hp": {
-                "ally":  {"king": None, "princess_left": None, "princess_right": None},
-                "enemy": {"king": None, "princess_left": None, "princess_right": None},
+            "tower_ocr": {
+                "ally":  {"princess_left": [], "king": [], "princess_right": []},
+                "enemy": {"princess_left": [], "king": [], "princess_right": []},
             },
         }
 
     def set(self, **fields):
+        from copy import deepcopy
         with self._lock:
-            self._data.update(fields)
+            for k, v in fields.items():
+                self._data[k] = deepcopy(v)
 
     def get(self):
+        from copy import deepcopy
         with self._lock:
-            return dict(self._data)
+            return deepcopy(self._data)
 
 STATUS = _Status()
 
-# ---------- tiny web ui (Flask) ----------
+# ---------- web ----------
 app = Flask(__name__)
 
 INDEX_HTML = """<!doctype html>
@@ -71,12 +74,12 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     html,body{background:#0b0b0b;color:#eaeaea;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:0}
-    .wrap{max-width:920px;margin:36px auto;padding:0 16px}
+    .wrap{max-width:980px;margin:36px auto;padding:0 16px}
     h1{font-size:24px;margin:0 0 12px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
     .card{background:#151515;border:1px solid #222;border-radius:12px;padding:14px}
     .k{opacity:.7;font-size:12px;margin-bottom:6px}
-    .v{font-size:16px;white-space:pre-wrap;word-break:break-word}
+    .v{font-size:15px;white-space:pre-wrap;word-break:break-word}
     .yes{color:#90ee90} .none{color:#ffadad}
     table{width:100%;border-collapse:collapse;margin-top:6px}
     th,td{border:1px solid #2a2a2a;padding:6px 8px;text-align:center;font-size:14px}
@@ -98,30 +101,30 @@ INDEX_HTML = """<!doctype html>
       <div class="card"><div class="k">play again btn</div><div id="play" class="v none">none</div></div>
       <div class="card" style="grid-column:1/-1"><div class="k">player hand</div><div id="hand" class="v">none</div></div>
       <div class="card" style="grid-column:1/-1"><div class="k">enemy troops</div><div id="enemy" class="v">none</div></div>
+
       <div class="card" style="grid-column:1/-1">
-        <div class="k">tower HP (%)</div>
+        <div class="k">tower OCR (all numbers found in big boxes)</div>
         <table>
           <thead>
             <tr><th></th><th>Princess L</th><th>King</th><th>Princess R</th></tr>
           </thead>
           <tbody>
-            <tr><th>Enemy</th><td id="e_pl">—</td><td id="e_k">—</td><td id="e_pr">—</td></tr>
-            <tr><th>Ally</th><td id="a_pl">—</td><td id="a_k">—</td><td id="a_pr">—</td></tr>
+            <tr><th>Enemy</th><td id="e_pl">[]</td><td id="e_k">[]</td><td id="e_pr">[]</td></tr>
+            <tr><th>Ally</th><td id="a_pl">[]</td><td id="a_k">[]</td><td id="a_pr">[]</td></tr>
           </tbody>
         </table>
       </div>
+
       <div class="card" style="grid-column:1/-1"><div class="k">last action</div><div id="last_action" class="v">none</div></div>
     </div>
 
-    <footer>Auto-refreshing. Raw JSON at <code>/status</code>.</footer>
+    <footer>Auto-refreshing. Raw JSON at <code>/status</code>. Crops saved to <code>debug/</code>.</footer>
   </div>
 
   <script>
     const $ = id => document.getElementById(id);
-    const fmtList = x => (!x || x.length===0) ? "none" : x.join(", ");
+    const fmtList = x => (!x || x.length===0) ? "[]" : "[" + x.join(", ") + "]";
     const fmt = x => (x===null || x===undefined || x==="" ? "none" : String(x));
-    const fmtHP = v => (v===null || v===undefined) ? "—" : String(Math.round(v));
-
     async function tick(){
       try{
         const res = await fetch("/status", {cache:"no-store"});
@@ -131,21 +134,21 @@ INDEX_HTML = """<!doctype html>
           $("step").textContent = fmt(j.step);
           $("epsilon").textContent = fmt(j.epsilon);
           $("elixir").textContent = fmt(j.elixir);
-          $("hand").textContent = fmtList(j.hand);
-          $("enemy").textContent = fmtList(j.enemy);
+          $("hand").textContent = (j.hand && j.hand.length) ? j.hand.join(", ") : "none";
+          $("enemy").textContent = (j.enemy && j.enemy.length) ? j.enemy.join(", ") : "none";
           $("win").textContent = j.win ? "yes" : "none";
           $("win").className = "v " + (j.win ? "yes" : "none");
           $("play").textContent = j.play_again ? "yes" : "none";
           $("play").className = "v " + (j.play_again ? "yes" : "none");
           $("last_action").textContent = fmt(j.last_action);
 
-          const hp = j.tower_hp || {ally:{},enemy:{}};
-          $("e_pl").textContent = fmtHP(hp.enemy?.princess_left);
-          $("e_k").textContent  = fmtHP(hp.enemy?.king);
-          $("e_pr").textContent = fmtHP(hp.enemy?.princess_right);
-          $("a_pl").textContent = fmtHP(hp.ally?.princess_left);
-          $("a_k").textContent  = fmtHP(hp.ally?.king);
-          $("a_pr").textContent = fmtHP(hp.ally?.princess_right);
+          const t = j.tower_ocr || {ally:{},enemy:{}};
+          $("e_pl").textContent = fmtList(t.enemy?.princess_left || []);
+          $("e_k").textContent  = fmtList(t.enemy?.king || []);
+          $("e_pr").textContent = fmtList(t.enemy?.princess_right || []);
+          $("a_pl").textContent = fmtList(t.ally?.princess_left || []);
+          $("a_k").textContent  = fmtList(t.ally?.king || []);
+          $("a_pr").textContent = fmtList(t.ally?.princess_right || []);
         }
       }catch(e){}
       setTimeout(tick, 150);
@@ -197,7 +200,6 @@ def save_checkpoint(agent):
 def start_endgame_watcher(bbox):
     stop_evt = threading.Event()
     finished_evt = threading.Event()
-
     def _watch():
         while not stop_evt.is_set():
             try:
@@ -210,7 +212,6 @@ def start_endgame_watcher(bbox):
             except Exception:
                 pass
             time.sleep(CHECK_INTERVAL)
-
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
     return t, stop_evt, finished_evt
@@ -240,7 +241,7 @@ def end_episode_cleanly(bbox):
         time.sleep(PLAY_AGAIN_RETRY_DELAY)
     return False
 
-# ---------- safe getters ----------
+# ---------- safe getter ----------
 def _safe(env, names):
     for n in names:
         fn = getattr(env, n, None)
@@ -281,7 +282,9 @@ def train():
                 hand   = _safe(env, ("get_current_hand",))
                 enemy  = _safe(env, ("get_enemy_detections",))
                 elixir = _safe(env, ("get_elixir",))
-                tower  = _safe(env, ("get_tower_hp",))
+
+                # big OCR numbers from tower areas
+                tower_ocr = env.get_tower_ocr_debug()
 
                 play_again_detected = find_play_again_center(bbox) is not None
 
@@ -289,7 +292,7 @@ def train():
                     hand=hand or [],
                     enemy=enemy or [],
                     elixir=elixir,
-                    tower_hp=tower or STATUS.get().get("tower_hp"),
+                    tower_ocr=tower_ocr or STATUS.get().get("tower_ocr"),
                     win=finished.is_set(),
                     play_again=play_again_detected,
                     step=step,
