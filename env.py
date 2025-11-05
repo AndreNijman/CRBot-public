@@ -10,6 +10,7 @@ from inference_sdk import InferenceHTTPClient
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 
+# Optional: set Tesseract exe via env if not on PATH
 TESSERACT_EXE = os.getenv("TESSERACT_EXE")
 if TESSERACT_EXE and os.path.isfile(TESSERACT_EXE):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
@@ -18,7 +19,7 @@ load_dotenv()
 
 MAX_ENEMIES = 10
 MAX_ALLIES  = 10
-SPELL_CARDS = ["Fireball","Zap","Arrows","Tornado","Rocket","Lightning","Freeze"]
+SPELL_CARDS = ["Fireball", "Zap", "Arrows", "Tornado", "Rocket", "Lightning", "Freeze"]
 
 class ClashRoyaleEnv:
     def __init__(self):
@@ -51,7 +52,7 @@ class ClashRoyaleEnv:
         self._last_enemy  = []
         self._last_elixir = None
 
-        # Tower HP caches
+        # Tower HP caches (current nums and max nums detected this match)
         self._tower_hp_curr = {
             "ally":  {"king": None, "princess_left": None, "princess_right": None},
             "enemy": {"king": None, "princess_left": None, "princess_right": None},
@@ -62,6 +63,7 @@ class ClashRoyaleEnv:
         }
         self._tower_max_initialized = False
 
+    # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
         api_key = os.getenv('ROBOFLOW_API_KEY')
         if not api_key:
@@ -74,6 +76,7 @@ class ClashRoyaleEnv:
             raise ValueError("ROBOFLOW_API_KEY environment variable is not set. Please check your .env file.")
         return InferenceHTTPClient(api_url="http://localhost:9001", api_key=api_key)
 
+    # ---------------- Lifecycle ----------------
     def reset(self):
         time.sleep(3)
         self.game_over_flag = None
@@ -89,16 +92,14 @@ class ClashRoyaleEnv:
         self._last_hand = []
         self._last_enemy = []
         self._last_elixir = None
-        self._tower_hp_curr = {
-            "ally":  {"king": None, "princess_left": None, "princess_right": None},
-            "enemy": {"king": None, "princess_left": None, "princess_right": None},
-        }
-        self._tower_hp_max = {
-            "ally":  {"king": None, "princess_left": None, "princess_right": None},
-            "enemy": {"king": None, "princess_left": None, "princess_right": None},
-        }
+
+        for side in ("ally","enemy"):
+            for slot in ("king","princess_left","princess_right"):
+                self._tower_hp_curr[side][slot] = None
+                self._tower_hp_max[side][slot] = None
         self._tower_max_initialized = False
 
+        # Try to capture initial max HPs at game start
         self._prime_tower_max_hp()
         return self._get_state()
 
@@ -107,30 +108,34 @@ class ClashRoyaleEnv:
         if self._endgame_thread:
             self._endgame_thread.join()
 
+    # ---------------- Main RL step ----------------
     def step(self, action_index):
         if not self.match_over_detected and hasattr(self.actions, "detect_match_over") and self.actions.detect_match_over():
             self.match_over_detected = True
+
         if self.match_over_detected:
-            action_index = len(self.available_actions) - 1
+            action_index = len(self.available_actions) - 1  # no-op
 
         if self.game_over_flag:
             done = True
             reward = self._compute_reward(self._get_state())
-            if self.game_over_flag == "victory": reward += 100
-            elif self.game_over_flag == "defeat": reward -= 100
+            if self.game_over_flag == "victory":
+                reward += 100
+            elif self.game_over_flag == "defeat":
+                reward -= 100
             self.match_over_detected = False
             return self._get_state(), reward, done
 
         self.current_cards = self.detect_cards_in_hand()
 
-        if self.current_cards and all(c == "Unknown" for c in self.current_cards):
+        if self.current_cards and all(card == "Unknown" for card in self.current_cards):
             pyautogui.moveTo(1611, 831, duration=0.2)
             pyautogui.click()
             next_state = self._get_state()
             return next_state, 0, False
 
         card_index, x_frac, y_frac = self.available_actions[action_index]
-        spell_penalty = 0
+
         if card_index != -1 and card_index < len(self.current_cards):
             x = int(x_frac * self.actions.WIDTH) + self.actions.TOP_LEFT_X
             y = int(y_frac * self.actions.HEIGHT) + self.actions.TOP_LEFT_Y
@@ -138,15 +143,19 @@ class ClashRoyaleEnv:
             time.sleep(1)
 
         current_enemy_princess_towers = self._count_enemy_princess_towers()
-        princess_tower_reward = 20 if (self.prev_enemy_princess_towers is not None and current_enemy_princess_towers < self.prev_enemy_princess_towers) else 0
+        princess_tower_reward = 0
+        if self.prev_enemy_princess_towers is not None and current_enemy_princess_towers < self.prev_enemy_princess_towers:
+            princess_tower_reward = 20
         self.prev_enemy_princess_towers = current_enemy_princess_towers
 
         done = False
-        reward = self._compute_reward(self._get_state()) + spell_penalty + princess_tower_reward
+        reward = self._compute_reward(self._get_state()) + princess_tower_reward
         next_state = self._get_state()
         return next_state, reward, done
 
+    # ---------------- State construction ----------------
     def _get_state(self):
+        # Always refresh frame and attempt OCR so UI keeps updating
         self.actions.capture_area(self.screenshot_path)
         elixir = self.actions.count_elixir()
         self._last_elixir = int(elixir) if elixir is not None else None
@@ -169,7 +178,7 @@ class ClashRoyaleEnv:
             if isinstance(first, dict) and "predictions" in first:
                 predictions = first["predictions"]
 
-        # Always try to update tower HP (uses preds or fallback ROIs)
+        # Update tower HP every state tick (uses preds or fallback ROIs)
         try:
             self._update_tower_hp_from_ocr(predictions)
         except Exception:
@@ -193,9 +202,11 @@ class ClashRoyaleEnv:
             if cls.startswith("ally"):
                 allies.append((x,y))
             elif cls.startswith("enemy"):
-                enemies.append((x,y)); enemy_names.append(cls.replace("enemy ","",1) if cls.startswith("enemy ") else (cls_raw or "enemy"))
+                enemies.append((x,y))
+                enemy_names.append(cls.replace("enemy ","",1) if cls.startswith("enemy ") else (cls_raw or "enemy"))
             else:
-                enemies.append((x,y)); enemy_names.append(cls_raw if cls_raw else "unknown")
+                enemies.append((x,y))
+                enemy_names.append(cls_raw if cls_raw else "unknown")
 
         self._last_enemy = enemy_names
 
@@ -209,7 +220,7 @@ class ClashRoyaleEnv:
         enemy_flat = [c for pos in pad(enemies, MAX_ENEMIES) for c in pos]
         return np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
 
-    # ---------- Tower OCR ----------
+    # ---------------- Tower OCR ----------------
     def _prime_tower_max_hp(self):
         for _ in range(4):
             try:
@@ -238,10 +249,7 @@ class ClashRoyaleEnv:
         if not os.path.isfile(self.screenshot_path): return
         img = Image.open(self.screenshot_path).convert("RGB")
 
-        # Try model-driven boxes first
         boxes = self._get_tower_boxes(predictions)
-
-        # If model gave nothing for a side, use static ROIs based on field geometry
         for side in ("ally","enemy"):
             if not any(boxes[side].values()):
                 boxes[side] = self._fallback_tower_rois(img.size, side)
@@ -279,33 +287,26 @@ class ClashRoyaleEnv:
             for it in arr:
                 if it["type"] == "king": king = it
                 else:
-                    if left is None or it["x"] < left["x"]:
-                        right = left; left = it
-                    elif right is None or it["x"] > (right["x"] if right else -10**9):
+                    if left is None or it["x"] < (left["x"] if left else 10**9):
+                        left = it
+                    if right is None or it["x"] > (right["x"] if right else -10**9):
                         right = it
             return {"princess_left": left, "king": king, "princess_right": right}
 
         return {"ally": choose(by["ally"]), "enemy": choose(by["enemy"])}
 
     def _fallback_tower_rois(self, img_size, side):
-        """
-        Heuristic ROIs when model boxes are missing.
-        Uses Actions field rect to guess tower centers.
-        """
         L = self.actions.TOP_LEFT_X
         T = self.actions.TOP_LEFT_Y
         W = self.actions.WIDTH
         H = self.actions.HEIGHT
 
-        # Approximate tower anchor positions in field coords
-        # X at 25%, 50%, 75%; enemy Y near top, ally Y near bottom.
         xs = [L + int(0.25 * W), L + int(0.50 * W), L + int(0.75 * W)]
         if side == "enemy":
-            ys = [T + int(0.17 * H), T + int(0.08 * H), T + int(0.17 * H)]  # L, K, R towers higher up
+            ys = [T + int(0.17 * H), T + int(0.08 * H), T + int(0.17 * H)]
         else:
-            ys = [T + int(0.86 * H), T + int(0.94 * H), T + int(0.86 * H)]  # L, K, R near bottom
+            ys = [T + int(0.86 * H), T + int(0.94 * H), T + int(0.86 * H)]
 
-        # Box size relative to field (coarse)
         bw = max(100, int(0.18 * W))
         bh = max(120, int(0.22 * H))
 
@@ -349,9 +350,10 @@ class ClashRoyaleEnv:
         m = re.search(r"(\d{2,6})", txt)
         return int(m.group(1)) if m else None
 
-    # ---------- reward / cards / etc. (unchanged below) ----------
+    # ---------------- Reward ----------------
     def _compute_reward(self, state):
-        if state is None: return 0
+        if state is None:
+            return 0
         elixir = state[0] * 10
         enemy_positions = state[1 + 2 * MAX_ALLIES:]
         enemy_presence = sum(enemy_positions[1::2])
@@ -365,6 +367,7 @@ class ClashRoyaleEnv:
         self.prev_enemy_presence = enemy_presence
         return reward
 
+    # ---------------- Hand detection ----------------
     def detect_cards_in_hand(self):
         try:
             card_paths = self.actions.capture_individual_cards()
@@ -378,50 +381,75 @@ class ClashRoyaleEnv:
                     workflow_id="custom-workflow",
                     images={"image": card_path}
                 )
-                preds = []
+                predictions = []
                 if isinstance(results, list) and results:
-                    d = results[0].get("predictions", {})
-                    if isinstance(d, dict):
-                        preds = d.get("predictions", [])
-                cards.append(preds[0].get("class","Unknown") if preds else "Unknown")
+                    preds_dict = results[0].get("predictions", {})
+                    if isinstance(preds_dict, dict):
+                        predictions = preds_dict.get("predictions", [])
+                cards.append(predictions[0].get("class", "Unknown") if predictions else "Unknown")
             self._last_hand = list(cards)
             return cards
         except Exception:
             return []
 
+    # ---------------- Action space ----------------
     def get_available_actions(self):
-        return [[card, x/(self.grid_width-1), y/(self.grid_height-1)]
-                for card in range(self.num_cards)
-                for x in range(self.grid_width)
-                for y in range(self.grid_height)] + [[-1,0,0]]
+        actions = [
+            [card, x / (self.grid_width - 1), y / (self.grid_height - 1)]
+            for card in range(self.num_cards)
+            for x in range(self.grid_width)
+            for y in range(self.grid_height)
+        ]
+        actions.append([-1, 0, 0])  # No-op
+        return actions
 
+    # ---------------- Endgame watcher ----------------
     def _endgame_watcher(self):
+        """Don’t crash if Actions has no detect_game_end()."""
         while not self._endgame_thread_stop.is_set():
-            result = self.actions.detect_game_end()
-            if result:
-                self.game_over_flag = result
-                break
+            try:
+                fn = getattr(self.actions, "detect_game_end", None)
+                result = fn() if callable(fn) else None
+                if result:
+                    self.game_over_flag = result
+                    break
+            except Exception:
+                pass
             time.sleep(0.1)
 
+    # ---------------- Princess towers ----------------
     def _count_enemy_princess_towers(self):
         self.actions.capture_area(self.screenshot_path)
         ws = os.getenv('WORKSPACE_TROOP_DETECTION')
         results = self.rf_model.run_workflow(
-            workspace_name=ws, workflow_id="detect-count-and-visualize",
+            workspace_name=ws,
+            workflow_id="detect-count-and-visualize",
             images={"image": self.screenshot_path}
         )
-        preds = []
+        predictions = []
         if isinstance(results, dict) and "predictions" in results:
-            preds = results["predictions"]
-        elif isinstance(results, list) and results and isinstance(results[0], dict) and "predictions" in results[0]:
-            preds = results[0]["predictions"]
-        return sum(1 for p in preds if isinstance(p, dict) and p.get("class") == "enemy princess tower")
+            predictions = results["predictions"]
+        elif isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, dict) and "predictions" in first:
+                predictions = first["predictions"]
+        return sum(1 for p in predictions if isinstance(p, dict) and p.get("class") == "enemy princess tower")
 
-    # ----- getters for web UI -----
-    def get_current_hand(self): return list(self._last_hand)
-    def get_enemy_detections(self): return list(self._last_enemy)
-    def get_elixir(self): return self._last_elixir
+    # ---------------- Getters for web UI ----------------
+    def get_current_hand(self):
+        return list(self._last_hand)
+
+    def get_enemy_detections(self):
+        return list(self._last_enemy)
+
+    def get_elixir(self):
+        return self._last_elixir
+
     def get_tower_hp(self):
+        """
+        Returns percentages 0..100 (rounded client-side) or None if unknown.
+        Keys: tower_hp = { ally:{princess_left, king, princess_right}, enemy:{...} }
+        """
         out = {"ally": {"king": None, "princess_left": None, "princess_right": None},
                "enemy": {"king": None, "princess_left": None, "princess_right": None}}
         for side in ("ally","enemy"):
