@@ -35,10 +35,15 @@ class _Status:
         from threading import Lock
         self._lock = Lock()
         self._data = {
+            "episode": 0,
+            "step": 0,
+            "epsilon": 1.0,
             "hand": [],
             "enemy": [],
+            "elixir": None,
             "win": False,
             "play_again": False,
+            "last_action": None,
         }
 
     def set(self, **fields):
@@ -62,15 +67,14 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     html,body{background:#0b0b0b;color:#eaeaea;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:0}
-    .wrap{max-width:780px;margin:40px auto;padding:0 16px}
-    h1{font-size:24px;margin:0 0 10px}
-    .card{background:#151515;border:1px solid #222;border-radius:12px;padding:16px;margin-top:12px}
-    .row{display:flex;gap:12px;flex-wrap:wrap}
-    .chip{flex:1 1 220px;background:#111;border:1px solid #242424;border-radius:10px;padding:12px}
+    .wrap{max-width:880px;margin:36px auto;padding:0 16px}
+    h1{font-size:24px;margin:0 0 12px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    .card{background:#151515;border:1px solid #222;border-radius:12px;padding:14px}
     .k{opacity:.7;font-size:12px;margin-bottom:6px}
     .v{font-size:16px;white-space:pre-wrap;word-break:break-word}
     .yes{color:#90ee90} .none{color:#ffadad}
-    footer{opacity:.6;font-size:12px;margin-top:14px}
+    footer{opacity:.6;font-size:12px;margin-top:12px}
     code{background:#0f0f0f;border:1px solid #222;border-radius:6px;padding:2px 6px}
   </style>
 </head>
@@ -78,51 +82,42 @@ INDEX_HTML = """<!doctype html>
   <div class="wrap">
     <h1>CRBot status</h1>
 
-    <div class="card">
-      <div class="row">
-        <div class="chip">
-          <div class="k">player hand</div>
-          <div id="hand" class="v">none</div>
-        </div>
-        <div class="chip">
-          <div class="k">enemy troops</div>
-          <div id="enemy" class="v">none</div>
-        </div>
-      </div>
-      <div class="row" style="margin-top:12px">
-        <div class="chip">
-          <div class="k">win screen</div>
-          <div id="win" class="v none">none</div>
-        </div>
-        <div class="chip">
-          <div class="k">play again btn</div>
-          <div id="play" class="v none">none</div>
-        </div>
-      </div>
-      <footer>Auto-refreshing. Open <code>/status</code> for raw JSON.</footer>
+    <div class="grid">
+      <div class="card"><div class="k">episode</div><div id="episode" class="v">0</div></div>
+      <div class="card"><div class="k">step</div><div id="step" class="v">0</div></div>
+      <div class="card"><div class="k">epsilon</div><div id="epsilon" class="v">1.0</div></div>
+      <div class="card"><div class="k">elixir</div><div id="elixir" class="v">none</div></div>
+      <div class="card"><div class="k">win screen</div><div id="win" class="v none">none</div></div>
+      <div class="card"><div class="k">play again btn</div><div id="play" class="v none">none</div></div>
+      <div class="card" style="grid-column:1/-1"><div class="k">player hand</div><div id="hand" class="v">none</div></div>
+      <div class="card" style="grid-column:1/-1"><div class="k">enemy troops</div><div id="enemy" class="v">none</div></div>
+      <div class="card" style="grid-column:1/-1"><div class="k">last action</div><div id="last_action" class="v">none</div></div>
     </div>
+
+    <footer>Auto-refreshing. Raw JSON at <code>/status</code>.</footer>
   </div>
 
   <script>
     const $ = id => document.getElementById(id);
-    function fmt(x){
-      if(!x || x.length===0) return "none";
-      if(Array.isArray(x)) return x.join(", ");
-      return String(x);
-    }
+    const fmtList = x => (!x || x.length===0) ? "none" : x.join(", ");
+    const fmt = x => (x===null || x===undefined || x==="" ? "none" : String(x));
     async function tick(){
       try{
         const res = await fetch("/status", {cache:"no-store"});
-        if(!res.ok) throw new Error("bad");
-        const j = await res.json();
-        $("hand").textContent = fmt(j.hand);
-        $("enemy").textContent = fmt(j.enemy);
-
-        $("win").textContent = j.win ? "yes" : "none";
-        $("win").className = "v " + (j.win ? "yes" : "none");
-
-        $("play").textContent = j.play_again ? "yes" : "none";
-        $("play").className = "v " + (j.play_again ? "yes" : "none");
+        if(res.ok){
+          const j = await res.json();
+          $("episode").textContent = fmt(j.episode);
+          $("step").textContent = fmt(j.step);
+          $("epsilon").textContent = fmt(j.epsilon);
+          $("elixir").textContent = fmt(j.elixir);
+          $("hand").textContent = fmtList(j.hand);
+          $("enemy").textContent = fmtList(j.enemy);
+          $("win").textContent = j.win ? "yes" : "none";
+          $("win").className = "v " + (j.win ? "yes" : "none");
+          $("play").textContent = j.play_again ? "yes" : "none";
+          $("play").className = "v " + (j.play_again ? "yes" : "none");
+          $("last_action").textContent = fmt(j.last_action);
+        }
       }catch(e){}
       setTimeout(tick, 200);
     }
@@ -140,10 +135,8 @@ def status():
     return jsonify(STATUS.get())
 
 def _run_web():
-    # quiet server
     import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
 
 # ---------- model io ----------
@@ -183,7 +176,6 @@ def start_endgame_watcher(bbox):
                 win = has_winner_text(img)
                 if win:
                     finished_evt.set()
-                # keep UI updated
                 cur = STATUS.get()
                 STATUS.set(win=win, play_again=cur.get("play_again", False))
             except Exception:
@@ -219,14 +211,13 @@ def end_episode_cleanly(bbox):
         time.sleep(PLAY_AGAIN_RETRY_DELAY)
     return False
 
-# ---------- helpers for pulling detections from env ----------
+# ---------- safe getters from env ----------
 def _safe_get_hand(env):
     for name in ("get_current_hand", "get_hand", "current_hand"):
         fn = getattr(env, name, None)
         if callable(fn):
             try:
-                v = fn() or []
-                return v
+                return fn() or []
             except Exception:
                 return []
     return []
@@ -236,17 +227,26 @@ def _safe_get_enemy(env):
         fn = getattr(env, name, None)
         if callable(fn):
             try:
-                v = fn() or []
-                return v
+                return fn() or []
             except Exception:
                 return []
     return []
+
+def _safe_get_elixir(env):
+    for name in ("get_elixir", "current_elixir", "elixir"):
+        fn = getattr(env, name, None)
+        if callable(fn):
+            try:
+                v = fn()
+                return int(v) if v is not None else None
+            except Exception:
+                return None
+    return None
 
 # ---------- main ----------
 def train():
     assert_tesseract_ready()
 
-    # start web ui
     web_thread = threading.Thread(target=_run_web, daemon=True)
     web_thread.start()
 
@@ -254,28 +254,37 @@ def train():
     agent = DQNAgent(env.state_size, env.action_size)
     load_latest(agent)
 
-    for _ in range(EPISODES):
+    for ep in range(EPISODES):
         bbox = align_and_get_bbox()
         state = env.reset()
         total_reward = 0.0
         done = False
+        step = 0
+
+        # expose episode + epsilon immediately
+        STATUS.set(episode=ep + 1, epsilon=getattr(agent, "epsilon", 1.0), step=0)
 
         watcher, stop_watch, finished = start_endgame_watcher(bbox)
         start_ts = time.time()
 
         try:
             while not done:
-                # poll env to feed UI
+                step += 1
+
                 hand = _safe_get_hand(env)
                 enemy = _safe_get_enemy(env)
+                elixir = _safe_get_elixir(env)
 
-                # detect playagain (don’t click yet)
                 play_again_detected = find_play_again_center(bbox) is not None
+
                 STATUS.set(
                     hand=hand if hand else [],
                     enemy=enemy if enemy else [],
+                    elixir=elixir,
                     win=finished.is_set(),
                     play_again=play_again_detected,
+                    step=step,
+                    epsilon=getattr(agent, "epsilon", 1.0),
                 )
 
                 if finished.is_set():
@@ -283,6 +292,8 @@ def train():
                     break
 
                 action = agent.act(state)
+                STATUS.set(last_action=str(action))
+
                 next_state, reward, step_done = env.step(action)
                 agent.remember(state, action, reward, next_state, step_done)
                 agent.replay(BATCH_SIZE)
@@ -298,7 +309,7 @@ def train():
         end_ts = time.time()
         write_match(start_ts, end_ts)
 
-        if _ % 10 == 0:
+        if ep % 10 == 0:
             agent.update_target_model()
             save_checkpoint(agent)
 
