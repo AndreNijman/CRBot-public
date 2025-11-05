@@ -9,7 +9,6 @@ from datetime import datetime
 from env import ClashRoyaleEnv
 from dqn_agent import DQNAgent
 
-# Autonomy bits
 from window_helper import align_and_get_bbox
 from vision import (
     screenshot_region,
@@ -18,8 +17,8 @@ from vision import (
     assert_tesseract_ready,
 )
 from logger import write_match
+from ui_simple import StatusUI
 
-# ---- config
 EPISODES = 10000
 BATCH_SIZE = 32
 CHECK_INTERVAL = 0.35
@@ -28,7 +27,6 @@ PLAY_AGAIN_RETRY_DELAY = 0.4
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# ---- model io
 def get_latest_model_path(models_dir=MODELS_DIR):
     files = glob.glob(os.path.join(models_dir, "model_*.pth"))
     if not files:
@@ -45,7 +43,6 @@ def load_latest(agent):
             with open(meta, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 agent.epsilon = d.get("epsilon", 1.0)
-        print(f"Loaded {os.path.basename(latest)} | epsilon={agent.epsilon}")
 
 def save_checkpoint(agent):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -53,10 +50,8 @@ def save_checkpoint(agent):
     torch.save(agent.model.state_dict(), path)
     with open(os.path.join(MODELS_DIR, f"meta_{ts}.json"), "w", encoding="utf-8") as f:
         json.dump({"epsilon": agent.epsilon}, f)
-    print(f"Saved checkpoint -> {path}")
 
-# ---- end-of-game watcher (WINNER OCR)
-def start_endgame_watcher(bbox):
+def start_endgame_watcher(bbox, ui: StatusUI):
     stop_evt = threading.Event()
     finished_evt = threading.Event()
 
@@ -64,30 +59,35 @@ def start_endgame_watcher(bbox):
         while not stop_evt.is_set():
             try:
                 img = screenshot_region(bbox)
-                if has_winner_text(img):
+                win = has_winner_text(img)
+                if win:
                     finished_evt.set()
-                    return
-            except Exception as e:
-                # Never kill the thread on OCR issues
-                print(f"OCR watch error: {e}")
+                # keep UI showing win flag live
+                ui.update(
+                    hand=None,  # unchanged here
+                    enemy=None,  # unchanged here
+                    win=win,
+                    play_again=False,  # filled by main loop when scanned
+                )
+            except Exception:
+                # swallow
+                pass
             time.sleep(CHECK_INTERVAL)
 
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
     return t, stop_evt, finished_evt
 
-# ---- play again click
 def click_play_again(bbox):
     pos = find_play_again_center(bbox)
     if not pos:
         return False
     try:
         import pyautogui as pag
-        pag.moveTo(*pos, duration=0.15)
+        pag.moveTo(*pos, duration=0.10)
         pag.click()
         return True
-    except Exception as e:
-        print(f"Play Again click error: {e}")
+    except Exception:
         return False
 
 def end_episode_cleanly(bbox):
@@ -102,29 +102,62 @@ def end_episode_cleanly(bbox):
         time.sleep(PLAY_AGAIN_RETRY_DELAY)
     return False
 
-# ---- main loop
+def _safe_get_hand(env):
+    # Try common hooks. Fallback to []
+    for name in ("get_current_hand", "get_hand", "current_hand"):
+        fn = getattr(env, name, None)
+        if callable(fn):
+            try:
+                return fn() or []
+            except Exception:
+                return []
+    return []
+
+def _safe_get_enemy(env):
+    for name in ("get_enemy_detections", "get_enemy_units", "enemy_units"):
+        fn = getattr(env, name, None)
+        if callable(fn):
+            try:
+                return fn() or []
+            except Exception:
+                return []
+    return []
+
 def train():
-    # Fail fast if Tesseract isn’t reachable
     assert_tesseract_ready()
 
+    ui = StatusUI()
     env = ClashRoyaleEnv()
     agent = DQNAgent(env.state_size, env.action_size)
     load_latest(agent)
 
     for ep in range(EPISODES):
-        bbox = align_and_get_bbox()  # right-edge, full-height (from window_helper)
+        bbox = align_and_get_bbox()
         state = env.reset()
         total_reward = 0.0
         done = False
 
-        print(f"Episode {ep + 1} | epsilon={agent.epsilon:.3f}")
-
-        watcher, stop_watch, finished = start_endgame_watcher(bbox)
+        watcher, stop_watch, finished = start_endgame_watcher(bbox, ui)
         start_ts = time.time()
 
         try:
             while not done:
-                if finished.is_set():  # game finished by OCR
+                # pull current detections for UI
+                hand = _safe_get_hand(env)
+                enemy = _safe_get_enemy(env)
+
+                # scan play-again presence without clicking yet
+                play_again_detected = find_play_again_center(bbox) is not None
+
+                # update UI (only)
+                ui.update(
+                    hand=hand if hand else [],
+                    enemy=enemy if enemy else [],
+                    win=finished.is_set(),
+                    play_again=play_again_detected,
+                )
+
+                if finished.is_set():
                     done = True
                     break
 
@@ -140,11 +173,10 @@ def train():
             stop_watch.set()
             watcher.join(timeout=1.0)
 
-        clicked = end_episode_cleanly(bbox)
+        # click play again after win screen detected
+        end_episode_cleanly(bbox)
         end_ts = time.time()
-        write_match(start_ts, end_ts)  # extend later with crowns/hp
-
-        print(f"Episode {ep + 1}: reward={total_reward:.2f} clicked_play_again={clicked}")
+        write_match(start_ts, end_ts)
 
         if ep % 10 == 0:
             agent.update_target_model()
