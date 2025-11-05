@@ -1,4 +1,4 @@
-# train.py (web UI + quiet training loop)
+# train.py (web UI + quiet training loop + tower HP UI)
 import os
 import time
 import glob
@@ -44,6 +44,10 @@ class _Status:
             "win": False,
             "play_again": False,
             "last_action": None,
+            "tower_hp": {
+                "ally":  {"king": None, "princess_left": None, "princess_right": None},
+                "enemy": {"king": None, "princess_left": None, "princess_right": None},
+            },
         }
 
     def set(self, **fields):
@@ -67,13 +71,16 @@ INDEX_HTML = """<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     html,body{background:#0b0b0b;color:#eaeaea;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:0}
-    .wrap{max-width:880px;margin:36px auto;padding:0 16px}
+    .wrap{max-width:920px;margin:36px auto;padding:0 16px}
     h1{font-size:24px;margin:0 0 12px}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
     .card{background:#151515;border:1px solid #222;border-radius:12px;padding:14px}
     .k{opacity:.7;font-size:12px;margin-bottom:6px}
     .v{font-size:16px;white-space:pre-wrap;word-break:break-word}
     .yes{color:#90ee90} .none{color:#ffadad}
+    table{width:100%;border-collapse:collapse;margin-top:6px}
+    th,td{border:1px solid #2a2a2a;padding:6px 8px;text-align:center;font-size:14px}
+    th{background:#101010}
     footer{opacity:.6;font-size:12px;margin-top:12px}
     code{background:#0f0f0f;border:1px solid #222;border-radius:6px;padding:2px 6px}
   </style>
@@ -91,6 +98,18 @@ INDEX_HTML = """<!doctype html>
       <div class="card"><div class="k">play again btn</div><div id="play" class="v none">none</div></div>
       <div class="card" style="grid-column:1/-1"><div class="k">player hand</div><div id="hand" class="v">none</div></div>
       <div class="card" style="grid-column:1/-1"><div class="k">enemy troops</div><div id="enemy" class="v">none</div></div>
+      <div class="card" style="grid-column:1/-1">
+        <div class="k">tower HP (%)</div>
+        <table>
+          <thead>
+            <tr><th></th><th>Princess L</th><th>King</th><th>Princess R</th></tr>
+          </thead>
+          <tbody>
+            <tr><th>Enemy</th><td id="e_pl">—</td><td id="e_k">—</td><td id="e_pr">—</td></tr>
+            <tr><th>Ally</th><td id="a_pl">—</td><td id="a_k">—</td><td id="a_pr">—</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div class="card" style="grid-column:1/-1"><div class="k">last action</div><div id="last_action" class="v">none</div></div>
     </div>
 
@@ -101,6 +120,8 @@ INDEX_HTML = """<!doctype html>
     const $ = id => document.getElementById(id);
     const fmtList = x => (!x || x.length===0) ? "none" : x.join(", ");
     const fmt = x => (x===null || x===undefined || x==="" ? "none" : String(x));
+    const fmtHP = v => (v===null || v===undefined) ? "—" : String(Math.round(v));
+
     async function tick(){
       try{
         const res = await fetch("/status", {cache:"no-store"});
@@ -117,9 +138,17 @@ INDEX_HTML = """<!doctype html>
           $("play").textContent = j.play_again ? "yes" : "none";
           $("play").className = "v " + (j.play_again ? "yes" : "none");
           $("last_action").textContent = fmt(j.last_action);
+
+          const hp = j.tower_hp || {ally:{},enemy:{}};
+          $("e_pl").textContent = fmtHP(hp.enemy?.princess_left);
+          $("e_k").textContent  = fmtHP(hp.enemy?.king);
+          $("e_pr").textContent = fmtHP(hp.enemy?.princess_right);
+          $("a_pl").textContent = fmtHP(hp.ally?.princess_left);
+          $("a_k").textContent  = fmtHP(hp.ally?.king);
+          $("a_pr").textContent = fmtHP(hp.ally?.princess_right);
         }
       }catch(e){}
-      setTimeout(tick, 200);
+      setTimeout(tick, 150);
     }
     tick();
   </script>
@@ -211,34 +240,13 @@ def end_episode_cleanly(bbox):
         time.sleep(PLAY_AGAIN_RETRY_DELAY)
     return False
 
-# ---------- safe getters from env ----------
-def _safe_get_hand(env):
-    for name in ("get_current_hand", "get_hand", "current_hand"):
-        fn = getattr(env, name, None)
+# ---------- safe getters ----------
+def _safe(env, names):
+    for n in names:
+        fn = getattr(env, n, None)
         if callable(fn):
             try:
-                return fn() or []
-            except Exception:
-                return []
-    return []
-
-def _safe_get_enemy(env):
-    for name in ("get_enemy_detections", "get_enemy_units", "enemy_units", "get_visible_enemies"):
-        fn = getattr(env, name, None)
-        if callable(fn):
-            try:
-                return fn() or []
-            except Exception:
-                return []
-    return []
-
-def _safe_get_elixir(env):
-    for name in ("get_elixir", "current_elixir", "elixir"):
-        fn = getattr(env, name, None)
-        if callable(fn):
-            try:
-                v = fn()
-                return int(v) if v is not None else None
+                return fn()
             except Exception:
                 return None
     return None
@@ -261,7 +269,6 @@ def train():
         done = False
         step = 0
 
-        # expose episode + epsilon immediately
         STATUS.set(episode=ep + 1, epsilon=getattr(agent, "epsilon", 1.0), step=0)
 
         watcher, stop_watch, finished = start_endgame_watcher(bbox)
@@ -271,16 +278,18 @@ def train():
             while not done:
                 step += 1
 
-                hand = _safe_get_hand(env)
-                enemy = _safe_get_enemy(env)
-                elixir = _safe_get_elixir(env)
+                hand   = _safe(env, ("get_current_hand",))
+                enemy  = _safe(env, ("get_enemy_detections",))
+                elixir = _safe(env, ("get_elixir",))
+                tower  = _safe(env, ("get_tower_hp",))
 
                 play_again_detected = find_play_again_center(bbox) is not None
 
                 STATUS.set(
-                    hand=hand if hand else [],
-                    enemy=enemy if enemy else [],
+                    hand=hand or [],
+                    enemy=enemy or [],
                     elixir=elixir,
+                    tower_hp=tower or STATUS.get().get("tower_hp"),
                     win=finished.is_set(),
                     play_again=play_again_detected,
                     step=step,
