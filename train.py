@@ -16,6 +16,7 @@ from vision import (
     screenshot_region,
     has_winner_text,
     find_play_again_center,
+    find_start_battle_center,
     assert_tesseract_ready,
 )
 from logger import write_match
@@ -26,6 +27,8 @@ BATCH_SIZE = 32
 CHECK_INTERVAL = 0.20
 PLAY_AGAIN_RETRIES = 8
 PLAY_AGAIN_RETRY_DELAY = 0.35
+START_BUTTON_RETRIES = 8
+START_BUTTON_DELAY = 5.0
 MODELS_DIR = "models"
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -229,6 +232,20 @@ def click_play_again(bbox):
     except Exception:
         return False
 
+
+def click_start_next_battle(bbox):
+    pos = find_start_battle_center(bbox)
+    if not pos:
+        return False
+    try:
+        import pyautogui as pag
+        pag.moveTo(*pos, duration=0.10)
+        pag.click()
+        return True
+    except Exception:
+        return False
+
+
 def end_episode_cleanly(bbox):
     try:
         import pyautogui as pag
@@ -237,9 +254,28 @@ def end_episode_cleanly(bbox):
         pass
     for _ in range(PLAY_AGAIN_RETRIES):
         if click_play_again(bbox):
+            break
+        time.sleep(PLAY_AGAIN_RETRY_DELAY)
+    else:
+        return False
+
+    time.sleep(START_BUTTON_DELAY)
+
+    for _ in range(START_BUTTON_RETRIES):
+        if click_start_next_battle(bbox):
             return True
         time.sleep(PLAY_AGAIN_RETRY_DELAY)
     return False
+
+
+def _set_env_input_lock(env, locked: bool) -> None:
+    actions = getattr(env, "actions", None)
+    setter = getattr(actions, "set_input_lock", None)
+    if callable(setter):
+        try:
+            setter(locked)
+        except Exception:
+            pass
 
 # ---------- safe getter ----------
 def _safe(env, names):
@@ -274,6 +310,7 @@ def train():
 
         watcher, stop_watch, finished = start_endgame_watcher(bbox)
         start_ts = time.time()
+        endgame_input_locked = False
 
         try:
             while not done:
@@ -300,6 +337,9 @@ def train():
                 )
 
                 if finished.is_set():
+                    if not endgame_input_locked:
+                        _set_env_input_lock(env, True)
+                        endgame_input_locked = True
                     done = True
                     break
 
@@ -317,7 +357,12 @@ def train():
             stop_watch.set()
             watcher.join(timeout=1.0)
 
-        end_episode_cleanly(bbox)
+        restart_complete = end_episode_cleanly(bbox)
+        if endgame_input_locked:
+            if restart_complete:
+                _set_env_input_lock(env, False)
+            else:
+                print("Warning: Restart sequence incomplete; inputs remain locked.")
         end_ts = time.time()
         write_match(start_ts, end_ts)
 

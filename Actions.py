@@ -39,6 +39,13 @@ class Actions:
 
         self.card_keys = {0: '1', 1: '2', 2: '3', 3: '4'}
         self.current_card_positions = {}
+        self._input_locked = False
+
+    def set_input_lock(self, locked: bool):
+        self._input_locked = bool(locked)
+
+    def is_input_locked(self) -> bool:
+        return self._input_locked
 
     # --- SAFE STUB so env._endgame_watcher never crashes ---
     def detect_game_end(self):
@@ -96,6 +103,8 @@ class Actions:
 
     # ---------- Plays ----------
     def card_play(self, x, y, card_index):
+        if self._input_locked:
+            return
         if card_index in self.card_keys:
             key = self.card_keys[card_index]
             pyautogui.press(key)
@@ -104,6 +113,8 @@ class Actions:
             pyautogui.click()
 
     def click_battle_start(self):
+        if self._input_locked:
+            return False
         button_image = os.path.join(self.images_folder, "battlestartbutton.png")
         confidences = [0.8, 0.7, 0.6, 0.5]
         region = (1486, 755, 1730 - 1486, 900 - 755)
@@ -123,6 +134,8 @@ class Actions:
             time.sleep(1)
 
     def press_play_again_keyburst(self, repeats=1, delay=0.25, keys=('1', 'b', 'n')):
+        if self._input_locked:
+            return
         for _ in range(repeats):
             for key in keys:
                 pyautogui.press(key)

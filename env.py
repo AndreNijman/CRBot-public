@@ -79,6 +79,12 @@ class ClashRoyaleEnv:
 
     # ---------------- Lifecycle ----------------
     def reset(self):
+        setter = getattr(self.actions, "set_input_lock", None)
+        if callable(setter):
+            try:
+                setter(False)
+            except Exception:
+                pass
         time.sleep(3)
         self.game_over_flag = None
         self._endgame_thread_stop.clear()
@@ -125,8 +131,16 @@ class ClashRoyaleEnv:
         self.current_cards = self.detect_cards_in_hand()
 
         if self.current_cards and all(card == "Unknown" for card in self.current_cards):
-            pyautogui.moveTo(1611, 831, duration=0.2)
-            pyautogui.click()
+            locked = False
+            checker = getattr(self.actions, "is_input_locked", None)
+            if callable(checker):
+                try:
+                    locked = checker()
+                except Exception:
+                    locked = False
+            if not locked:
+                pyautogui.moveTo(1611, 831, duration=0.2)
+                pyautogui.click()
             next_state = self._get_state()
             return next_state, 0, False
 

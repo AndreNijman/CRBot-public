@@ -18,8 +18,11 @@ if os.name == "nt" and os.path.isfile(TESSERACT_EXE):
     if os.path.isdir(tessdata):
         os.environ.setdefault("TESSDATA_PREFIX", tessdata)
 
-PLAY_AGAIN_RGB = (239, 178, 40)  # given color
-COLOR_TOL = 18                   # bump to 24–28 if needed
+PLAY_AGAIN_RGB = (73, 164, 239)  # previously (239, 178, 40)
+PLAY_AGAIN_TOL = 18
+
+SECOND_BUTTON_RGB = (239, 175, 0)
+SECOND_BUTTON_TOL = 24
 
 # -------- Helpers --------
 def assert_tesseract_ready() -> None:
@@ -63,27 +66,64 @@ def has_winner_text(img: Image.Image) -> bool:
         print(f"OCR error: {e}")
         return False
 
-def find_play_again_center(bbox: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
-    """Scan bottom half for the target color. Returns absolute screen coords or None."""
+def _find_color_center(
+    bbox: Tuple[int, int, int, int],
+    target_rgb: Tuple[int, int, int],
+    tolerance: int,
+    vertical_slice: Tuple[float, float] = (0.5, 1.0),
+) -> Optional[Tuple[int, int]]:
+    """
+    Find the median pixel location of a target color inside a vertical slice of the bbox.
+    Returns absolute screen coordinates or None.
+    """
     L, T, W, H = bbox
-    img = pag.screenshot(region=(L, T + H // 2, W, H // 2))
+    start_frac, end_frac = vertical_slice
+    start_frac = max(0.0, min(start_frac, 1.0))
+    end_frac = max(start_frac, min(end_frac, 1.0))
+
+    slice_top = int(round(H * start_frac))
+    slice_bottom = int(round(H * end_frac))
+    slice_height = max(1, slice_bottom - slice_top)
+
+    img = pag.screenshot(region=(L, T + slice_top, W, slice_height))
     arr = np.asarray(img, dtype=np.int16)[:, :, :3]  # int16 avoids overflow
 
-    r, g, b = PLAY_AGAIN_RGB
+    r, g, b = target_rgb
+    tol = max(0, tolerance)
     dr = np.abs(arr[:, :, 0] - r)
     dg = np.abs(arr[:, :, 1] - g)
     db = np.abs(arr[:, :, 2] - b)
-    mask = (dr <= COLOR_TOL) & (dg <= COLOR_TOL) & (db <= COLOR_TOL)
+    mask = (dr <= tol) & (dg <= tol) & (db <= tol)
 
-    if not mask.any():
+    if mask.sum() == 0:
         return None
 
     ys, xs = np.where(mask)
-    # median reduces outliers
     cx = int(np.median(xs))
     cy = int(np.median(ys))
 
-    # absolute screen coords
     abs_x = L + cx
-    abs_y = T + H // 2 + cy
+    abs_y = T + slice_top + cy
     return (abs_x, abs_y)
+
+
+def find_play_again_center(bbox: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+    """Locate the Play Again button color in the lower half of the bbox."""
+    return _find_color_center(
+        bbox,
+        PLAY_AGAIN_RGB,
+        PLAY_AGAIN_TOL,
+        vertical_slice=(0.5, 1.0),
+    )
+
+
+def find_start_battle_center(bbox: Tuple[int, int, int, int]) -> Optional[Tuple[int, int]]:
+    """Locate the yellow confirmation button used to start the next match."""
+    return _find_color_center(
+        bbox,
+        SECOND_BUTTON_RGB,
+        SECOND_BUTTON_TOL,
+        vertical_slice=(0.45, 1.0),
+    )
+
+

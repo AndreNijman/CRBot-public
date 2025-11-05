@@ -3,12 +3,21 @@ import time
 import pyautogui as pag
 
 from window_helper import align_and_get_bbox
-from vision import screenshot_region, has_winner_text, find_play_again_center
+from vision import (
+    screenshot_region,
+    has_winner_text,
+    find_play_again_center,
+    find_start_battle_center,
+)
 from logger import write_match
 
 pag.FAILSAFE = True
 
 CHECK_INTERVAL = 0.35  # seconds
+PLAY_AGAIN_RETRIES = 8
+START_BUTTON_RETRIES = 8
+RETRY_DELAY = 0.4
+START_BUTTON_DELAY = 5.0
 
 def wait_for_match_end(bbox) -> bool:
     """Poll for 'WINNER' anywhere. Returns True when detected."""
@@ -27,15 +36,35 @@ def click_play_again(bbox) -> bool:
     pag.click()
     return True
 
+
+def click_start_next_battle(bbox) -> bool:
+    """Find the yellow confirmation button and click it."""
+    pos = find_start_battle_center(bbox)
+    if not pos:
+        return False
+    pag.moveTo(*pos, duration=0.15)
+    pag.click()
+    return True
+
 def end_episode_cleanly(bbox):
     # Stop all actions for a short beat
     pag.mouseUp()  # if held
     time.sleep(0.5)
-    # one click on Play Again
-    for _ in range(8):
+    # Click Play Again (blue button)
+    for _ in range(PLAY_AGAIN_RETRIES):
         if click_play_again(bbox):
+            break
+        time.sleep(RETRY_DELAY)
+    else:
+        return False
+
+    # Allow queue screen to render before searching for the yellow button
+    time.sleep(START_BUTTON_DELAY)
+
+    for _ in range(START_BUTTON_RETRIES):
+        if click_start_next_battle(bbox):
             return True
-        time.sleep(0.4)
+        time.sleep(RETRY_DELAY)
     return False
 
 def run_one_episode():
@@ -54,7 +83,7 @@ def run_one_episode():
     end_ts = time.time()
     write_match(start_ts, end_ts)
 
-    print(f"Logged match. Duration {end_ts - start_ts:.1f}s. PlayAgainClicked={clicked}")
+    print(f"Logged match. Duration {end_ts - start_ts:.1f}s. RestartSequenceComplete={clicked}")
 
 if __name__ == "__main__":
     while True:
