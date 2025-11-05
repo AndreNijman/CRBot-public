@@ -42,8 +42,8 @@ class ClashRoyaleEnv:
         self.match_over_detected = False
 
         # ---- UI-facing caches (read by train.py via getters) ----
-        self._last_hand   = []      # list[str] (player hand card names)
-        self._last_enemy  = []      # list[str] (enemy troop class names)
+        self._last_hand   = []      # list[str]
+        self._last_enemy  = []      # list[str]
         self._last_elixir = None    # int 0..10
 
     # ---------------- Roboflow setups ----------------
@@ -179,11 +179,10 @@ class ClashRoyaleEnv:
 
         # No predictions -> return previous state shape if possible
         if not predictions:
-            # still return a valid state vector shape
             ally_flat = [0.0] * (2 * MAX_ALLIES)
             enemy_flat = [0.0] * (2 * MAX_ENEMIES)
             state = np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
-            # also clear enemy cache since none seen
+            # clear enemy cache since none seen
             self._last_enemy = []
             return state
 
@@ -205,20 +204,25 @@ class ClashRoyaleEnv:
         for p in predictions:
             if not isinstance(p, dict):
                 continue
-            cls = normalize_class(p.get("class", ""))
+            cls_raw = p.get("class", "")
+            cls = normalize_class(cls_raw)
             if cls in TOWER_CLASSES:
                 continue
-            x = p.get("x")
-            y = p.get("y")
+            x = p.get("x"); y = p.get("y")
             if x is None or y is None:
                 continue
+
             if cls.startswith("ally"):
                 allies.append((x, y))
+                # we don't list ally names in UI
             elif cls.startswith("enemy"):
                 enemies.append((x, y))
-                # try to strip the "enemy " prefix for a nicer name
-                enemy_name = cls.replace("enemy ", "", 1) if cls.startswith("enemy ") else cls
-                enemy_names.append(enemy_name)
+                name = cls.replace("enemy ", "", 1) if cls.startswith("enemy ") else (cls_raw or "enemy")
+                enemy_names.append(name)
+            else:
+                # Unknown team label from model. Treat as enemy so UI shows something.
+                enemies.append((x, y))
+                enemy_names.append(cls_raw if cls_raw else "unknown")
 
         # Update enemy cache (names only)
         self._last_enemy = enemy_names
@@ -297,7 +301,7 @@ class ClashRoyaleEnv:
             self._last_hand = list(cards)
             return cards
         except Exception:
-            # On error, keep previous cache but return empty to avoid breaking logic
+            # keep previous cache but return empty to avoid breaking logic
             return []
 
     # ---------------- Action space ----------------
@@ -318,7 +322,7 @@ class ClashRoyaleEnv:
             if result:
                 self.game_over_flag = result
                 break
-            time.sleep(0.5)
+            time.sleep(0.1)  # faster polling
 
     # ---------------- Princess towers ----------------
     def _count_enemy_princess_towers(self):
@@ -344,13 +348,10 @@ class ClashRoyaleEnv:
 
     # ---------------- Getters for web UI ----------------
     def get_current_hand(self):
-        """Latest detected player hand as list[str]."""
         return list(self._last_hand)
 
     def get_enemy_detections(self):
-        """Latest detected enemy troop classes as list[str]."""
         return list(self._last_enemy)
 
     def get_elixir(self):
-        """Latest detected elixir as an int 0..10 or None."""
         return self._last_elixir
