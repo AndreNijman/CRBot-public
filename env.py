@@ -242,7 +242,9 @@ class ClashRoyaleEnv:
                 return
 
         target_dt = 1.0 / 60.0
-        blank = np.zeros((240, 320, 3), dtype=np.uint8)
+        max_height = 720
+        max_width = 1280
+        blank = np.zeros((360, 640, 3), dtype=np.uint8)
 
         while not self._window_preview_stop.is_set():
             start = time.time()
@@ -254,14 +256,23 @@ class ClashRoyaleEnv:
                 if capture is not None:
                     frame = cv2.cvtColor(np.array(capture.convert("RGB")), cv2.COLOR_RGB2BGR)
                     frame = self._annotate_window_frame(frame, bbox)
-                    if self._window_preview_size != (width, height):
-                        try:
-                            cv2.resizeWindow(name, width, height)
-                        except Exception:
-                            pass
-                        self._window_preview_size = (width, height)
             if frame is None:
-                frame = blank
+                frame = blank.copy()
+            h, w = frame.shape[:2]
+            scale = 1.0
+            if h > max_height:
+                scale = min(scale, max_height / float(h))
+            if w > max_width:
+                scale = min(scale, max_width / float(w))
+            if scale < 1.0:
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                h, w = frame.shape[:2]
+            if (w, h) != self._window_preview_size:
+                try:
+                    cv2.resizeWindow(name, w, h)
+                except Exception:
+                    pass
+                self._window_preview_size = (w, h)
             cv2.imshow(name, frame)
             cv2.waitKey(1)
             elapsed = time.time() - start
@@ -276,6 +287,8 @@ class ClashRoyaleEnv:
         annotated = frame_bgr.copy()
         height, width = annotated.shape[:2]
         left, top, _, _ = bbox
+
+        overlay = annotated.copy()
 
         # Draw detections
         field_offset_x = self.actions.TOP_LEFT_X - left
@@ -310,14 +323,15 @@ class ClashRoyaleEnv:
                 label = f"{cls} ({score:.2f})"
             cls_lower = cls.lower() if isinstance(cls, str) else ""
             if "enemy" in cls_lower:
-                color = (48, 48, 230)  # Red-ish (BGR)
+                color = (40, 40, 230)
             elif "ally" in cls_lower:
-                color = (48, 180, 48)  # Green-ish
+                color = (40, 200, 40)
             else:
-                color = (200, 200, 48)  # Yellow-ish
+                color = (60, 200, 200)
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
             cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
-            text_origin = (x0, max(12, y0 - 6))
-            cv2.putText(annotated, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            text_origin = (x0 + 4, max(16, y0 + 16))
+            self._draw_label_with_bg(annotated, label, text_origin, color)
 
         # Draw card bar annotations
         card_left = self.actions.CARD_BAR_X - left
@@ -330,7 +344,9 @@ class ClashRoyaleEnv:
             x1 = max(0, min(width - 1, int(card_left + card_w)))
             y1 = max(0, min(height - 1, int(card_top + card_h)))
             if x1 > x0 and y1 > y0:
-                cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 140, 0), 2)
+                base_color = (0, 180, 255)
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), base_color, -1)
+                cv2.rectangle(annotated, (x0, y0), (x1, y1), base_color, 2)
                 slot_width = card_w / max(1, self.num_cards)
                 cards = self._last_hand or []
                 for idx, card_name in enumerate(cards):
@@ -340,23 +356,51 @@ class ClashRoyaleEnv:
                     sx1 = max(0, min(width - 1, sx1))
                     if sx1 <= sx0:
                         continue
-                    cv2.rectangle(annotated, (sx0, y0), (sx1, y1), (255, 200, 0), 1)
+                    cv2.rectangle(overlay, (sx0, y0), (sx1, y1), base_color, -1)
+                    cv2.rectangle(annotated, (sx0, y0), (sx1, y1), base_color, 1)
                     text = str(card_name)
-                    text_x = sx0 + 4
-                    text_y = min(height - 5, y1 + 18)
-                    cv2.putText(annotated, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
+                    text_pos = (sx0 + 4, min(height - 6, y1 - 6))
+                    self._draw_label_with_bg(annotated, text, text_pos, base_color)
+
+        cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
 
         info_lines = [
-            f"Enemies detected: {len(predictions)}",
+            f"Detections: {len(predictions)}",
             "Hand: " + (", ".join(self._last_hand) if self._last_hand else "unknown"),
         ]
         y = 20
         for line in info_lines:
-            cv2.putText(annotated, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(annotated, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+            self._draw_label_with_bg(annotated, line, (10, y), (255, 255, 255))
             y += 22
 
         return annotated
+
+    def _draw_label_with_bg(self, img, text, org, color):
+        if cv2 is None:
+            return
+        x, y = org
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        thickness = 1
+        text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+        bg_color = (0, 0, 0)
+        cv2.rectangle(
+            img,
+            (x - 4, y - text_size[1] - 6),
+            (x + text_size[0] + 4, y + 6),
+            bg_color,
+            cv2.FILLED,
+        )
+        cv2.putText(
+            img,
+            text,
+            (x, y),
+            font,
+            scale,
+            color,
+            thickness + 1,
+            cv2.LINE_AA,
+        )
 
     def _schedule_next_emote(self):
         low, high = self._emote_interval_range
