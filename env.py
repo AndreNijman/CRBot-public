@@ -2,12 +2,14 @@ import os
 import re
 import time
 import threading
+import random
+
 import numpy as np
 import pyautogui
 from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 import pytesseract
 
 # Optional: set Tesseract path via env if not on PATH
@@ -64,6 +66,10 @@ class ClashRoyaleEnv:
         self._last_predictions = []
         self._last_img_size = None  # (W, H)
 
+        self._emote_interval_range = (15.0, 45.0)
+        self._next_emote_time = None
+        self._next_elixir_debug = 0.0
+
     # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
         api_key = os.getenv('ROBOFLOW_API_KEY')
@@ -103,12 +109,148 @@ class ClashRoyaleEnv:
         self._last_predictions = []
         self._last_img_size = None
 
+        self._schedule_next_emote()
+
         return self._get_state()
 
     def close(self):
         self._endgame_thread_stop.set()
         if self._endgame_thread:
             self._endgame_thread.join()
+
+    def _schedule_next_emote(self):
+        low, high = self._emote_interval_range
+        delay = random.uniform(low, high)
+        self._next_emote_time = time.time() + delay
+
+    def _maybe_trigger_emote(self):
+        if self.match_over_detected or self.game_over_flag:
+            return
+        if self._next_emote_time is None:
+            self._schedule_next_emote()
+            return
+        if time.time() < self._next_emote_time:
+            return
+        checker = getattr(self.actions, "is_input_locked", None)
+        if callable(checker):
+            try:
+                if checker():
+                    self._next_emote_time = time.time() + 1.0
+                    return
+            except Exception:
+                pass
+        emote = getattr(self.actions, "emote_burst", None)
+        if callable(emote):
+            try:
+                emote()
+            except Exception:
+                pass
+        self._schedule_next_emote()
+
+    def _read_elixir_via_ocr(self):
+        try:
+            screen_width, screen_height = pyautogui.size()
+        except Exception:
+            # fallback to action bounds if screen size fails
+            screen_width = max(0, getattr(self.actions, "BOTTOM_RIGHT_X", 0))
+            screen_height = max(0, getattr(self.actions, "BOTTOM_RIGHT_Y", 0))
+
+        if screen_width <= 0 or screen_height <= 0:
+            return None
+
+        top = int(screen_height * 0.75)
+        height = max(60, screen_height - top)
+
+        try:
+            grab = pyautogui.screenshot(region=(0, top, screen_width, height))
+        except Exception:
+            return None
+
+        gray = grab.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+        gray = gray.filter(ImageFilter.MedianFilter(3))
+        thresh = gray.point(lambda p: 255 if p > 140 else 0)
+
+        try:
+            data = pytesseract.image_to_data(
+                thresh,
+                output_type=pytesseract.Output.DICT,
+                config="--psm 6 -c tessedit_char_whitelist=0123456789",
+            )
+        except Exception:
+            return None
+
+        best = None
+        candidates = []
+        texts = data.get("text", [])
+        tops = data.get("top", [])
+        heights = data.get("height", [])
+        lefts = data.get("left", [])
+        widths = data.get("width", [])
+        confs = data.get("conf", [])
+
+        for idx, raw_text in enumerate(texts):
+            text = raw_text.strip().replace("O", "0")
+            if not text or not text.isdigit():
+                continue
+            try:
+                value = int(text)
+            except ValueError:
+                continue
+            if value < 0 or value > 10:
+                continue
+            top_y = tops[idx] if idx < len(tops) else 0
+            height_val = heights[idx] if idx < len(heights) else 0
+            left = lefts[idx] if idx < len(lefts) else 0
+            width_val = widths[idx] if idx < len(widths) else 0
+            conf_raw = confs[idx] if idx < len(confs) else ""
+            absolute_bottom = top + top_y + height_val
+            cand = {
+                "value": value,
+                "left": int(left),
+                "top": int(top_y),
+                "width": int(width_val),
+                "height": int(height_val),
+                "abs_bottom": float(absolute_bottom),
+                "confidence": str(conf_raw),
+            }
+            cand["bottom"] = cand["top"] + max(cand["height"], 1)
+            candidates.append(cand)
+            if best is None or cand["abs_bottom"] > best["abs_bottom"]:
+                best = cand
+
+        if candidates:
+            try:
+                self._save_elixir_debug(grab, candidates, best)
+            except Exception:
+                pass
+
+        return best["value"] if best else None
+
+    def _save_elixir_debug(self, region_img, candidates, chosen):
+        now = time.time()
+        cooldown = getattr(self, "_next_elixir_debug", 0.0)
+        if now < cooldown:
+            return
+
+        annotated = region_img.convert("RGB")
+        draw = ImageDraw.Draw(annotated)
+
+        for cand in candidates:
+            left = max(0, cand["left"])
+            top = max(0, cand["top"])
+            right = left + max(1, cand["width"])
+            bottom = top + max(1, cand["height"])
+            color = "#ff7f50" if cand is chosen else "#6c6c6c"
+            draw.rectangle([(left, top), (right, bottom)], outline=color, width=2)
+            label = f"{cand['value']}"
+            if cand.get("confidence"):
+                label += f" ({cand['confidence']})"
+            draw.text((left, max(0, top - 14)), label, fill=color)
+
+        path = os.path.join(DEBUG_DIR, "elixir_ocr_region.png")
+        annotated.save(path)
+        self._next_elixir_debug = now + 0.75
 
     # ---------------- Main RL step ----------------
     def step(self, action_index):
@@ -117,6 +259,8 @@ class ClashRoyaleEnv:
 
         if self.match_over_detected:
             action_index = len(self.available_actions) - 1  # no-op
+
+        self._maybe_trigger_emote()
 
         if self.game_over_flag:
             done = True
@@ -167,6 +311,10 @@ class ClashRoyaleEnv:
     def _get_state(self):
         self.actions.capture_area(self.screenshot_path)
         elixir = self.actions.count_elixir()
+        if getattr(self.actions, "os_type", "") == "Windows":
+            ocr_elixir = self._read_elixir_via_ocr()
+            if ocr_elixir is not None:
+                elixir = ocr_elixir
         self._last_elixir = int(elixir) if elixir is not None else None
 
         ws = os.getenv('WORKSPACE_TROOP_DETECTION')

@@ -154,7 +154,7 @@ INDEX_HTML = """<!doctype html>
           $("a_pr").textContent = fmtList(t.ally?.princess_right || []);
         }
       }catch(e){}
-      setTimeout(tick, 150);
+      setTimeout(tick, 60);
     }
     tick();
   </script>

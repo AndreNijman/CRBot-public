@@ -14,7 +14,7 @@ def _fmt_list(x):
 class StatusUI:
     def __init__(self):
         self.last_render = 0.0
-        self.min_interval = 0.15  # seconds
+        self.min_interval = 0.05  # seconds
 
         self.hand = None
         self.enemy = None

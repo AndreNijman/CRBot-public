@@ -1,7 +1,9 @@
-import pyautogui
 import os
 import time
 import platform
+import random
+
+import pyautogui
 
 class Actions:
     def __init__(self):
@@ -86,16 +88,87 @@ class Actions:
                     pass
             return 0
         elif self.os_type == "Windows":
-            target = (225, 128, 229)
-            tol = 80
-            count = 0
-            for x in range(1512, 1892, 38):
-                r, g, b = pyautogui.pixel(x, 989)
-                if abs(r - target[0]) <= tol and abs(g - target[1]) <= tol and abs(b - target[2]) <= tol:
-                    count += 1
-            return count
+            count = self._count_elixir_windows_bar()
+            if count is None:
+                count = self._count_elixir_windows_fallback()
+            return max(0, min(10, count if count is not None else 0))
         else:
             return 0
+
+    def _count_elixir_windows_bar(self):
+        width = self.CARD_BAR_WIDTH
+        if width <= 0:
+            return None
+
+        region_height = max(40, int(self.CARD_BAR_HEIGHT * 0.5))
+        top = max(self.CARD_BAR_Y - region_height - 8, 0)
+
+        try:
+            grab = pyautogui.screenshot(
+                region=(self.CARD_BAR_X, top, width, region_height)
+            )
+        except Exception:
+            return None
+
+        img = grab.convert("RGB")
+        pixels = img.load()
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return None
+
+        segment_width = w / 10.0
+        start_y = max(0, int(h * 0.35))
+        end_y = min(h, int(h * 0.95))
+
+        def is_purple(r, g, b):
+            if r < 110 or b < 110:
+                return False
+            if r - g < 25 or b - g < 25:
+                return False
+            if abs(r - b) > 90:
+                return False
+            return True
+
+        filled_segments = 0
+        for idx in range(10):
+            x0 = int(idx * segment_width)
+            x1 = int((idx + 1) * segment_width)
+            if x1 <= x0:
+                x1 = min(w, x0 + 1)
+
+            purple = 0
+            total = 0
+            for y in range(start_y, end_y, 2):
+                for x in range(x0, min(x1, w), 2):
+                    r, g, b = pixels[x, y]
+                    total += 1
+                    if is_purple(r, g, b):
+                        purple += 1
+            if total and (purple / total) >= 0.12:
+                filled_segments += 1
+
+        return filled_segments
+
+    def _count_elixir_windows_fallback(self):
+        target = (225, 128, 229)
+        tolerance = 110
+        offsets = [62 + 38 * i for i in range(10)]
+        sample_y = int(self.CARD_BAR_Y + 142)
+
+        count = 0
+        for offset in offsets:
+            x = int(self.CARD_BAR_X + offset)
+            try:
+                r, g, b = pyautogui.pixel(x, sample_y)
+            except Exception:
+                continue
+            if (
+                abs(r - target[0]) <= tolerance
+                and abs(g - target[1]) <= tolerance
+                and abs(b - target[2]) <= tolerance
+            ):
+                count += 1
+        return count
 
     def update_card_positions(self, detections):
         sorted_cards = sorted(detections, key=lambda x: x['x'])
@@ -140,3 +213,10 @@ class Actions:
             for key in keys:
                 pyautogui.press(key)
                 time.sleep(delay)
+
+    def emote_burst(self):
+        if self._input_locked:
+            return
+        pyautogui.press('e')
+        time.sleep(0.5)
+        pyautogui.press(random.choice(('5', '6', '7', '8', '9', '0')))
