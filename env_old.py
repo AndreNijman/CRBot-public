@@ -9,23 +9,7 @@ import pyautogui
 from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
-from PIL import Image, ImageOps, ImageFilter
-
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
-try:
-    import pygetwindow as gw
-except Exception:
-    gw = None
-
-try:
-    from window_helper import WIN_TITLE as DEFAULT_GAME_TITLE
-except Exception:
-    DEFAULT_GAME_TITLE = "pyclashbot-96"
-
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
 import pytesseract
 
 # Optional: set Tesseract path via env if not on PATH
@@ -84,18 +68,7 @@ class ClashRoyaleEnv:
 
         self._emote_interval_range = (15.0, 45.0)
         self._next_emote_time = None
-
-        # Game window preview (for debugging/duplication)
-        self._gw_warned = False
-        self._window_bbox_warned = False
-        self._window_preview_name = "Game Window Preview"
-        self._window_preview_created = False
-        self._window_preview_stop = threading.Event()
-        self._window_preview_thread = None
-        self._window_preview_size = (0, 0)
-
-        if cv2 is not None:
-            self._start_window_preview_thread()
+        self._next_elixir_debug = 0.0
 
     # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
@@ -144,129 +117,6 @@ class ClashRoyaleEnv:
         self._endgame_thread_stop.set()
         if self._endgame_thread:
             self._endgame_thread.join()
-        if self._window_preview_thread is not None:
-            self._window_preview_stop.set()
-            self._window_preview_thread.join(timeout=1.0)
-            self._window_preview_thread = None
-        if cv2 is not None and getattr(self, "_window_preview_created", False):
-            try:
-                cv2.destroyWindow(self._window_preview_name)
-            except Exception:
-                pass
-            self._window_preview_created = False
-
-    def _get_game_window_bbox(self):
-        title = os.getenv("GAME_WINDOW_TITLE", DEFAULT_GAME_TITLE)
-        if not title:
-            return None
-        if gw is None:
-            if not self._gw_warned:
-                print("[ClashRoyaleEnv] Install pygetwindow to locate game window; falling back to full screen.")
-                self._gw_warned = True
-            return None
-        handles = []
-        try:
-            handles = gw.getWindowsWithTitle(title) or []
-        except Exception:
-            handles = []
-        if not handles:
-            try:
-                candidates = [
-                    t for t in gw.getAllTitles()
-                    if t and title.lower() in t.lower()
-                ]
-            except Exception:
-                candidates = []
-            for candidate in candidates:
-                try:
-                    handles = gw.getWindowsWithTitle(candidate) or []
-                except Exception:
-                    handles = []
-                if handles:
-                    break
-        if not handles:
-            if not self._window_bbox_warned:
-                print(f"[ClashRoyaleEnv] Game window containing '{title}' not found; falling back to full screen.")
-                self._window_bbox_warned = True
-            return None
-        win = handles[0]
-        if getattr(win, "isMinimized", False):
-            try:
-                win.restore()
-                time.sleep(0.05)
-            except Exception:
-                pass
-        left = max(0, getattr(win, "left", 0))
-        top = max(0, getattr(win, "top", 0))
-        width = max(0, getattr(win, "width", 0))
-        height = max(0, getattr(win, "height", 0))
-        if width <= 0 or height <= 0:
-            if not self._window_bbox_warned:
-                print("[ClashRoyaleEnv] Game window reported zero size; falling back to full screen.")
-                self._window_bbox_warned = True
-            return None
-        self._window_bbox_warned = False
-        return (left, top, width, height)
-
-    def _capture_region(self, left, top, width, height):
-        if width <= 0 or height <= 0:
-            return None
-        left = int(left)
-        top = int(top)
-        width = int(width)
-        height = int(height)
-
-        try:
-            return pyautogui.screenshot(region=(left, top, width, height))
-        except Exception:
-            return None
-
-    def _start_window_preview_thread(self):
-        if cv2 is None or self._window_preview_thread is not None:
-            return
-        self._window_preview_stop.clear()
-        thread = threading.Thread(target=self._window_preview_loop, daemon=True)
-        thread.start()
-        self._window_preview_thread = thread
-
-    def _window_preview_loop(self):
-        if cv2 is None:
-            return
-        name = self._window_preview_name
-        if not self._window_preview_created:
-            try:
-                cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-                self._window_preview_created = True
-            except Exception:
-                print("[ClashRoyaleEnv] Failed to create preview window; disabling.")
-                return
-
-        target_dt = 1.0 / 60.0
-        blank = np.zeros((240, 320, 3), dtype=np.uint8)
-
-        while not self._window_preview_stop.is_set():
-            start = time.time()
-            bbox = self._get_game_window_bbox()
-            frame = None
-            if bbox:
-                left, top, width, height = bbox
-                capture = self._capture_region(left, top, width, height)
-                if capture is not None:
-                    frame = cv2.cvtColor(np.array(capture.convert("RGB")), cv2.COLOR_RGB2BGR)
-                    if self._window_preview_size != (width, height):
-                        try:
-                            cv2.resizeWindow(name, width, height)
-                        except Exception:
-                            pass
-                        self._window_preview_size = (width, height)
-            if frame is None:
-                frame = blank
-            cv2.imshow(name, frame)
-            cv2.waitKey(1)
-            elapsed = time.time() - start
-            sleep = target_dt - elapsed
-            if sleep > 0:
-                time.sleep(sleep)
 
     def _schedule_next_emote(self):
         low, high = self._emote_interval_range
@@ -296,6 +146,111 @@ class ClashRoyaleEnv:
             except Exception:
                 pass
         self._schedule_next_emote()
+
+    def _read_elixir_via_ocr(self):
+        try:
+            screen_width, screen_height = pyautogui.size()
+        except Exception:
+            # fallback to action bounds if screen size fails
+            screen_width = max(0, getattr(self.actions, "BOTTOM_RIGHT_X", 0))
+            screen_height = max(0, getattr(self.actions, "BOTTOM_RIGHT_Y", 0))
+
+        if screen_width <= 0 or screen_height <= 0:
+            return None
+
+        top = int(screen_height * 0.75)
+        height = max(60, screen_height - top)
+
+        try:
+            grab = pyautogui.screenshot(region=(0, top, screen_width, height))
+        except Exception:
+            return None
+
+        gray = grab.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=2)
+        gray = gray.filter(ImageFilter.MedianFilter(3))
+        thresh = gray.point(lambda p: 255 if p > 140 else 0)
+
+        try:
+            data = pytesseract.image_to_data(
+                thresh,
+                output_type=pytesseract.Output.DICT,
+                config="--psm 6 -c tessedit_char_whitelist=0123456789",
+            )
+        except Exception:
+            return None
+
+        best = None
+        candidates = []
+        texts = data.get("text", [])
+        tops = data.get("top", [])
+        heights = data.get("height", [])
+        lefts = data.get("left", [])
+        widths = data.get("width", [])
+        confs = data.get("conf", [])
+
+        for idx, raw_text in enumerate(texts):
+            text = raw_text.strip().replace("O", "0")
+            if not text or not text.isdigit():
+                continue
+            try:
+                value = int(text)
+            except ValueError:
+                continue
+            if value < 0 or value > 10:
+                continue
+            top_y = tops[idx] if idx < len(tops) else 0
+            height_val = heights[idx] if idx < len(heights) else 0
+            left = lefts[idx] if idx < len(lefts) else 0
+            width_val = widths[idx] if idx < len(widths) else 0
+            conf_raw = confs[idx] if idx < len(confs) else ""
+            absolute_bottom = top + top_y + height_val
+            cand = {
+                "value": value,
+                "left": int(left),
+                "top": int(top_y),
+                "width": int(width_val),
+                "height": int(height_val),
+                "abs_bottom": float(absolute_bottom),
+                "confidence": str(conf_raw),
+            }
+            cand["bottom"] = cand["top"] + max(cand["height"], 1)
+            candidates.append(cand)
+            if best is None or cand["abs_bottom"] > best["abs_bottom"]:
+                best = cand
+
+        if candidates:
+            try:
+                self._save_elixir_debug(grab, candidates, best)
+            except Exception:
+                pass
+
+        return best["value"] if best else None
+
+    def _save_elixir_debug(self, region_img, candidates, chosen):
+        now = time.time()
+        cooldown = getattr(self, "_next_elixir_debug", 0.0)
+        if now < cooldown:
+            return
+
+        annotated = region_img.convert("RGB")
+        draw = ImageDraw.Draw(annotated)
+
+        for cand in candidates:
+            left = max(0, cand["left"])
+            top = max(0, cand["top"])
+            right = left + max(1, cand["width"])
+            bottom = top + max(1, cand["height"])
+            color = "#ff7f50" if cand is chosen else "#6c6c6c"
+            draw.rectangle([(left, top), (right, bottom)], outline=color, width=2)
+            label = f"{cand['value']}"
+            if cand.get("confidence"):
+                label += f" ({cand['confidence']})"
+            draw.text((left, max(0, top - 14)), label, fill=color)
+
+        path = os.path.join(DEBUG_DIR, "elixir_ocr_region.png")
+        annotated.save(path)
+        self._next_elixir_debug = now + 0.75
 
     # ---------------- Main RL step ----------------
     def step(self, action_index):
@@ -355,7 +310,12 @@ class ClashRoyaleEnv:
     # ---------------- State construction ----------------
     def _get_state(self):
         self.actions.capture_area(self.screenshot_path)
-        self._last_elixir = None
+        elixir = self.actions.count_elixir()
+        if getattr(self.actions, "os_type", "") == "Windows":
+            ocr_elixir = self._read_elixir_via_ocr()
+            if ocr_elixir is not None:
+                elixir = ocr_elixir
+        self._last_elixir = int(elixir) if elixir is not None else None
 
         ws = os.getenv('WORKSPACE_TROOP_DETECTION')
         if not ws:
