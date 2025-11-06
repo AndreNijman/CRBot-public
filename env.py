@@ -253,6 +253,7 @@ class ClashRoyaleEnv:
                 capture = self._capture_region(left, top, width, height)
                 if capture is not None:
                     frame = cv2.cvtColor(np.array(capture.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    frame = self._annotate_window_frame(frame, bbox)
                     if self._window_preview_size != (width, height):
                         try:
                             cv2.resizeWindow(name, width, height)
@@ -267,6 +268,95 @@ class ClashRoyaleEnv:
             sleep = target_dt - elapsed
             if sleep > 0:
                 time.sleep(sleep)
+
+    def _annotate_window_frame(self, frame_bgr, bbox):
+        if cv2 is None or frame_bgr is None or bbox is None:
+            return frame_bgr
+
+        annotated = frame_bgr.copy()
+        height, width = annotated.shape[:2]
+        left, top, _, _ = bbox
+
+        # Draw detections
+        field_offset_x = self.actions.TOP_LEFT_X - left
+        field_offset_y = self.actions.TOP_LEFT_Y - top
+        predictions = self._last_predictions or []
+        for pred in predictions:
+            if not isinstance(pred, dict):
+                continue
+            try:
+                cx = float(pred.get("x", 0))
+                cy = float(pred.get("y", 0))
+                w = float(pred.get("width", 0))
+                h = float(pred.get("height", 0))
+            except (TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            x0 = int(field_offset_x + cx - w / 2)
+            y0 = int(field_offset_y + cy - h / 2)
+            x1 = int(field_offset_x + cx + w / 2)
+            y1 = int(field_offset_y + cy + h / 2)
+            x0 = max(0, min(width - 1, x0))
+            y0 = max(0, min(height - 1, y0))
+            x1 = max(0, min(width - 1, x1))
+            y1 = max(0, min(height - 1, y1))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cls = pred.get("class", "unknown")
+            score = pred.get("confidence", pred.get("confidence_score", ""))
+            label = cls
+            if isinstance(score, (int, float)):
+                label = f"{cls} ({score:.2f})"
+            cls_lower = cls.lower() if isinstance(cls, str) else ""
+            if "enemy" in cls_lower:
+                color = (48, 48, 230)  # Red-ish (BGR)
+            elif "ally" in cls_lower:
+                color = (48, 180, 48)  # Green-ish
+            else:
+                color = (200, 200, 48)  # Yellow-ish
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
+            text_origin = (x0, max(12, y0 - 6))
+            cv2.putText(annotated, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        # Draw card bar annotations
+        card_left = self.actions.CARD_BAR_X - left
+        card_top = self.actions.CARD_BAR_Y - top
+        card_w = self.actions.CARD_BAR_WIDTH
+        card_h = self.actions.CARD_BAR_HEIGHT
+        if card_w > 0 and card_h > 0:
+            x0 = max(0, min(width - 1, int(card_left)))
+            y0 = max(0, min(height - 1, int(card_top)))
+            x1 = max(0, min(width - 1, int(card_left + card_w)))
+            y1 = max(0, min(height - 1, int(card_top + card_h)))
+            if x1 > x0 and y1 > y0:
+                cv2.rectangle(annotated, (x0, y0), (x1, y1), (255, 140, 0), 2)
+                slot_width = card_w / max(1, self.num_cards)
+                cards = self._last_hand or []
+                for idx, card_name in enumerate(cards):
+                    sx0 = int(card_left + idx * slot_width)
+                    sx1 = int(card_left + (idx + 1) * slot_width)
+                    sx0 = max(0, min(width - 1, sx0))
+                    sx1 = max(0, min(width - 1, sx1))
+                    if sx1 <= sx0:
+                        continue
+                    cv2.rectangle(annotated, (sx0, y0), (sx1, y1), (255, 200, 0), 1)
+                    text = str(card_name)
+                    text_x = sx0 + 4
+                    text_y = min(height - 5, y1 + 18)
+                    cv2.putText(annotated, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA)
+
+        info_lines = [
+            f"Enemies detected: {len(predictions)}",
+            "Hand: " + (", ".join(self._last_hand) if self._last_hand else "unknown"),
+        ]
+        y = 20
+        for line in info_lines:
+            cv2.putText(annotated, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(annotated, line, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
+            y += 22
+
+        return annotated
 
     def _schedule_next_emote(self):
         low, high = self._emote_interval_range
