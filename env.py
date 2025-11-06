@@ -360,7 +360,7 @@ class ClashRoyaleEnv:
                     cv2.rectangle(annotated, (sx0, y0), (sx1, y1), base_color, 1)
                     text = str(card_name)
                     text_pos = (sx0 + 4, min(height - 6, y1 - 6))
-                    self._draw_label_with_bg(annotated, text, text_pos, base_color)
+                    self._draw_label_with_bg(annotated, text, text_pos, base_color, scale=0.45)
 
         cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
 
@@ -375,12 +375,11 @@ class ClashRoyaleEnv:
 
         return annotated
 
-    def _draw_label_with_bg(self, img, text, org, color):
+    def _draw_label_with_bg(self, img, text, org, color, scale=0.55):
         if cv2 is None:
             return
         x, y = org
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.55
         thickness = 1
         text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
         bg_color = (0, 0, 0)
