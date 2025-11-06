@@ -9,7 +9,23 @@ import pyautogui
 from dotenv import load_dotenv
 from Actions import Actions
 from inference_sdk import InferenceHTTPClient
-from PIL import Image, ImageOps, ImageFilter, ImageDraw
+from PIL import Image, ImageOps, ImageFilter
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
+
+try:
+    from window_helper import WIN_TITLE as DEFAULT_GAME_TITLE
+except Exception:
+    DEFAULT_GAME_TITLE = "pyclashbot-96"
+
 import pytesseract
 
 # Optional: set Tesseract path via env if not on PATH
@@ -69,6 +85,14 @@ class ClashRoyaleEnv:
         self._emote_interval_range = (15.0, 45.0)
         self._next_emote_time = None
         self._next_elixir_debug = 0.0
+        self._elixir_window_name = "Elixir OCR"
+        self._elixir_window_created = False
+        self._elixir_warned = False
+        self._gw_warned = False
+        self._elixir_bbox_warned = False
+        if cv2 is None:
+            print("[ClashRoyaleEnv] OpenCV not available; elixir debug window disabled.")
+            self._elixir_warned = True
 
     # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
@@ -117,6 +141,65 @@ class ClashRoyaleEnv:
         self._endgame_thread_stop.set()
         if self._endgame_thread:
             self._endgame_thread.join()
+        if cv2 is not None and getattr(self, "_elixir_window_created", False):
+            try:
+                cv2.destroyWindow(self._elixir_window_name)
+            except Exception:
+                pass
+            self._elixir_window_created = False
+
+    def _get_game_window_bbox(self):
+        title = os.getenv("GAME_WINDOW_TITLE", DEFAULT_GAME_TITLE)
+        if not title:
+            return None
+        if gw is None:
+            if not self._gw_warned:
+                print("[ClashRoyaleEnv] Install pygetwindow to locate game window; falling back to full screen.")
+                self._gw_warned = True
+            return None
+        handles = []
+        try:
+            handles = gw.getWindowsWithTitle(title) or []
+        except Exception:
+            handles = []
+        if not handles:
+            try:
+                candidates = [
+                    t for t in gw.getAllTitles()
+                    if t and title.lower() in t.lower()
+                ]
+            except Exception:
+                candidates = []
+            for candidate in candidates:
+                try:
+                    handles = gw.getWindowsWithTitle(candidate) or []
+                except Exception:
+                    handles = []
+                if handles:
+                    break
+        if not handles:
+            if not self._elixir_bbox_warned:
+                print(f"[ClashRoyaleEnv] Game window containing '{title}' not found; falling back to full screen.")
+                self._elixir_bbox_warned = True
+            return None
+        win = handles[0]
+        if getattr(win, "isMinimized", False):
+            try:
+                win.restore()
+                time.sleep(0.05)
+            except Exception:
+                pass
+        left = max(0, getattr(win, "left", 0))
+        top = max(0, getattr(win, "top", 0))
+        width = max(0, getattr(win, "width", 0))
+        height = max(0, getattr(win, "height", 0))
+        if width <= 0 or height <= 0:
+            if not self._elixir_bbox_warned:
+                print("[ClashRoyaleEnv] Game window reported zero size; falling back to full screen.")
+                self._elixir_bbox_warned = True
+            return None
+        self._elixir_bbox_warned = False
+        return (left, top, width, height)
 
     def _schedule_next_emote(self):
         low, high = self._emote_interval_range
@@ -148,32 +231,69 @@ class ClashRoyaleEnv:
         self._schedule_next_emote()
 
     def _read_elixir_via_ocr(self):
-        try:
-            screen_width, screen_height = pyautogui.size()
-        except Exception:
-            # fallback to action bounds if screen size fails
-            screen_width = max(0, getattr(self.actions, "BOTTOM_RIGHT_X", 0))
-            screen_height = max(0, getattr(self.actions, "BOTTOM_RIGHT_Y", 0))
+        bbox = self._get_game_window_bbox()
+        if bbox:
+            left, top_origin, width, height_full = bbox
+        else:
+            try:
+                screen_width, screen_height = pyautogui.size()
+            except Exception:
+                screen_width = max(0, getattr(self.actions, "BOTTOM_RIGHT_X", 0))
+                screen_height = max(0, getattr(self.actions, "BOTTOM_RIGHT_Y", 0))
+            if screen_width <= 0 or screen_height <= 0:
+                return None
+            left, top_origin, width, height_full = 0, 0, screen_width, screen_height
 
-        if screen_width <= 0 or screen_height <= 0:
+        capture_height = max(60, int(height_full * 0.25))
+        capture_height = min(capture_height, height_full)
+        capture_top = top_origin + max(0, height_full - capture_height)
+
+        if width <= 0 or capture_height <= 0:
             return None
 
-        top = int(screen_height * 0.75)
-        height = max(60, screen_height - top)
+        region_left = int(left)
+        region_top = int(capture_top)
+        region_width = int(width)
+        region_height = int(capture_height)
 
         try:
-            grab = pyautogui.screenshot(region=(0, top, screen_width, height))
+            grab = pyautogui.screenshot(region=(region_left, region_top, region_width, region_height))
         except Exception:
             return None
+
+        capture_origin = (region_left, region_top)
 
         gray = grab.convert("L")
         gray = ImageOps.autocontrast(gray, cutoff=2)
         gray = gray.filter(ImageFilter.MedianFilter(3))
         thresh = gray.point(lambda p: 255 if p > 140 else 0)
 
+        rgb_np = np.array(grab)
+        if rgb_np.ndim == 2:
+            rgb_np = np.stack([rgb_np] * 3, axis=-1)
+        elif rgb_np.shape[2] == 4:
+            rgb_np = rgb_np[:, :, :3]
+
+        if cv2 is not None:
+            gray_np = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2GRAY)
+            blurred = cv2.GaussianBlur(gray_np, (3, 3), 0)
+            _, binary = cv2.threshold(
+                blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            binary = cv2.bitwise_not(binary)
+            kernel = np.ones((3, 3), np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+            ocr_image = Image.fromarray(binary)
+        else:
+            gray = grab.convert("L")
+            gray = ImageOps.autocontrast(gray, cutoff=1)
+            gray = gray.filter(ImageFilter.MedianFilter(3))
+            ocr_image = gray.point(lambda p: 255 if p > 135 else 0)
+
         try:
             data = pytesseract.image_to_data(
-                thresh,
+                ocr_image,
                 output_type=pytesseract.Output.DICT,
                 config="--psm 6 -c tessedit_char_whitelist=0123456789",
             )
@@ -204,7 +324,19 @@ class ClashRoyaleEnv:
             left = lefts[idx] if idx < len(lefts) else 0
             width_val = widths[idx] if idx < len(widths) else 0
             conf_raw = confs[idx] if idx < len(confs) else ""
-            absolute_bottom = top + top_y + height_val
+            try:
+                conf_val = float(conf_raw)
+            except (TypeError, ValueError):
+                conf_val = -1.0
+            if conf_val < 45.0:
+                continue
+            absolute_bottom = capture_origin[1] + top_y + height_val
+            width_px = int(width_val)
+            height_px = int(height_val)
+            if width_px <= 6 or height_px <= 14:
+                continue
+            if width_px * height_px <= 220:
+                continue
             cand = {
                 "value": value,
                 "left": int(left),
@@ -213,44 +345,119 @@ class ClashRoyaleEnv:
                 "height": int(height_val),
                 "abs_bottom": float(absolute_bottom),
                 "confidence": str(conf_raw),
+                "conf_score": conf_val,
             }
             cand["bottom"] = cand["top"] + max(cand["height"], 1)
             candidates.append(cand)
-            if best is None or cand["abs_bottom"] > best["abs_bottom"]:
-                best = cand
 
         if candidates:
-            try:
-                self._save_elixir_debug(grab, candidates, best)
-            except Exception:
-                pass
+            max_bottom = max(c["abs_bottom"] for c in candidates)
+            bottom_band = [
+                c for c in candidates if (max_bottom - c["abs_bottom"]) <= 40
+            ]
+            if bottom_band:
+                best = max(bottom_band, key=lambda c: (c["conf_score"], c["abs_bottom"]))
+            else:
+                best = max(candidates, key=lambda c: c["conf_score"])
+
+        try:
+            self._show_elixir_debug(grab, candidates, best, capture_origin, (region_width, region_height))
+        except Exception:
+            pass
 
         return best["value"] if best else None
 
-    def _save_elixir_debug(self, region_img, candidates, chosen):
+    def _show_elixir_debug(self, region_img, candidates, chosen, origin, size):
+        if cv2 is None:
+            if not getattr(self, "_elixir_warned", False):
+                print("[ClashRoyaleEnv] Install opencv-python to enable elixir debug window.")
+                self._elixir_warned = True
+            return
         now = time.time()
-        cooldown = getattr(self, "_next_elixir_debug", 0.0)
-        if now < cooldown:
+        if now < getattr(self, "_next_elixir_debug", 0.0):
             return
 
-        annotated = region_img.convert("RGB")
-        draw = ImageDraw.Draw(annotated)
+        if not getattr(self, "_elixir_window_created", False):
+            try:
+                cv2.namedWindow(self._elixir_window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(self._elixir_window_name, 420, 150)
+                self._elixir_window_created = True
+            except Exception:
+                if not self._elixir_warned:
+                    print("[ClashRoyaleEnv] Failed to create OpenCV debug window; disabling.")
+                    self._elixir_warned = True
+                return
+        rgb = np.array(region_img.convert("RGB"), dtype=np.uint8)
+        if rgb.ndim == 2:
+            rgb = np.stack([rgb] * 3, axis=-1)
+        frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        h, w = frame_bgr.shape[:2]
+        origin_x, origin_y = origin
+        region_w, region_h = size
+        info_lines = []
+        if chosen:
+            info_lines.append(
+                f"chosen: {chosen['value']} (conf {chosen.get('conf_score', 0):.0f})"
+            )
+        info_lines.append(
+            f"candidates: {len(candidates)}"
+        )
+        info_lines.append(f"region: {origin_x},{origin_y} {region_w}x{region_h}")
 
         for cand in candidates:
             left = max(0, cand["left"])
             top = max(0, cand["top"])
-            right = left + max(1, cand["width"])
-            bottom = top + max(1, cand["height"])
-            color = "#ff7f50" if cand is chosen else "#6c6c6c"
-            draw.rectangle([(left, top), (right, bottom)], outline=color, width=2)
+            right = min(w - 1, left + max(1, cand["width"]))
+            bottom = min(h - 1, top + max(1, cand["height"]))
+            if left >= w or top >= h:
+                continue
+            color = (230, 120, 60) if cand is chosen else (80, 80, 80)
+            cv2.rectangle(frame_bgr, (left, top), (right, bottom), color, 2)
             label = f"{cand['value']}"
-            if cand.get("confidence"):
-                label += f" ({cand['confidence']})"
-            draw.text((left, max(0, top - 14)), label, fill=color)
+            if cand.get("conf_score") is not None:
+                label = f"{label} ({cand['conf_score']:.0f})"
+            cv2.putText(
+                frame_bgr,
+                label,
+                (left, max(12, top - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
 
-        path = os.path.join(DEBUG_DIR, "elixir_ocr_region.png")
-        annotated.save(path)
-        self._next_elixir_debug = now + 0.75
+        if not candidates:
+            info_lines.append("no digits found")
+
+        y0 = 18
+        for line in info_lines:
+            cv2.putText(
+                frame_bgr,
+                line,
+                (8, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (230, 230, 230),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame_bgr,
+                line,
+                (8, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            y0 += 22
+
+        cv2.imshow(self._elixir_window_name, frame_bgr)
+        cv2.waitKey(1)
+        self._next_elixir_debug = now + 0.016
 
     # ---------------- Main RL step ----------------
     def step(self, action_index):
