@@ -26,6 +26,11 @@ try:
 except Exception:
     DEFAULT_GAME_TITLE = "pyclashbot-96"
 
+try:
+    from mss import mss as MSS
+except Exception:
+    MSS = None
+
 import pytesseract
 
 # Optional: set Tesseract path via env if not on PATH
@@ -90,9 +95,32 @@ class ClashRoyaleEnv:
         self._elixir_warned = False
         self._gw_warned = False
         self._elixir_bbox_warned = False
+        self._mss_warned = False
+        self._last_elixir_region = None
+        self._elixir_overlay_lock = threading.Lock()
+        self._elixir_overlay = {
+            "candidates": [],
+            "chosen": None,
+            "region_origin": (0, 0),
+            "region_size": (0, 0),
+            "updated": 0.0,
+        }
+        self._elixir_preview_stop = threading.Event()
+        self._elixir_preview_thread = None
+        self._mss = None
+        if MSS is not None:
+            try:
+                self._mss = MSS()
+            except Exception:
+                self._mss = None
+                if not self._mss_warned:
+                    print("[ClashRoyaleEnv] mss screen capture unavailable; falling back to pyautogui.")
+                    self._mss_warned = True
         if cv2 is None:
             print("[ClashRoyaleEnv] OpenCV not available; elixir debug window disabled.")
             self._elixir_warned = True
+        else:
+            self._ensure_elixir_preview_thread()
 
     # ---------------- Roboflow setups ----------------
     def setup_roboflow(self):
@@ -141,12 +169,22 @@ class ClashRoyaleEnv:
         self._endgame_thread_stop.set()
         if self._endgame_thread:
             self._endgame_thread.join()
+        if self._elixir_preview_thread is not None:
+            self._elixir_preview_stop.set()
+            self._elixir_preview_thread.join(timeout=1.0)
+            self._elixir_preview_thread = None
         if cv2 is not None and getattr(self, "_elixir_window_created", False):
             try:
                 cv2.destroyWindow(self._elixir_window_name)
             except Exception:
                 pass
             self._elixir_window_created = False
+        if self._mss is not None:
+            try:
+                self._mss.close()
+            except Exception:
+                pass
+            self._mss = None
 
     def _get_game_window_bbox(self):
         title = os.getenv("GAME_WINDOW_TITLE", DEFAULT_GAME_TITLE)
@@ -200,6 +238,145 @@ class ClashRoyaleEnv:
             return None
         self._elixir_bbox_warned = False
         return (left, top, width, height)
+
+    def _capture_region(self, left, top, width, height):
+        if width <= 0 or height <= 0:
+            return None
+        left = int(left)
+        top = int(top)
+        width = int(width)
+        height = int(height)
+
+        if self._mss is not None:
+            monitor = {"top": top, "left": left, "width": width, "height": height}
+            try:
+                raw = self._mss.grab(monitor)
+                frame = np.array(raw, dtype=np.uint8)
+                if frame.shape[2] == 4:
+                    frame = frame[:, :, :3]
+                frame = frame[:, :, ::-1]  # BGR -> RGB
+                return Image.fromarray(frame)
+            except Exception:
+                if not self._mss_warned:
+                    print("[ClashRoyaleEnv] mss capture failed; falling back to pyautogui.")
+                    self._mss_warned = True
+                self._mss = None
+        try:
+            return pyautogui.screenshot(region=(left, top, width, height))
+        except Exception:
+            return None
+
+    def _ensure_elixir_preview_thread(self):
+        if cv2 is None or self._elixir_preview_thread is not None:
+            return
+        self._elixir_preview_stop.clear()
+        t = threading.Thread(target=self._elixir_preview_loop, daemon=True)
+        t.start()
+        self._elixir_preview_thread = t
+
+    def _elixir_preview_loop(self):
+        name = self._elixir_window_name
+        if not self._elixir_window_created:
+            try:
+                cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(name, 420, 150)
+                self._elixir_window_created = True
+            except Exception:
+                if not self._elixir_warned:
+                    print("[ClashRoyaleEnv] Failed to create OpenCV debug window; disabling.")
+                    self._elixir_warned = True
+                return
+        target_dt = 1.0 / 120.0
+        blank = np.zeros((120, 360, 3), dtype=np.uint8)
+        while not self._elixir_preview_stop.is_set():
+            start = time.time()
+            region = self._last_elixir_region
+            if region:
+                left, top, width, height = region
+                frame_img = self._capture_region(left, top, width, height)
+            else:
+                frame_img = None
+            if frame_img is not None:
+                arr = np.array(frame_img.convert("RGB"))
+                frame_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = blank.copy()
+            with self._elixir_overlay_lock:
+                overlay = dict(self._elixir_overlay)
+                candidates = [dict(c) for c in overlay.get("candidates", [])]
+                chosen = overlay.get("chosen")
+                origin = overlay.get("region_origin", (0, 0))
+                size = overlay.get("region_size", (frame_bgr.shape[1], frame_bgr.shape[0]))
+            frame_bgr = self._draw_elixir_overlay(frame_bgr, candidates, chosen, origin, size)
+            cv2.imshow(name, frame_bgr)
+            cv2.waitKey(1)
+            elapsed = time.time() - start
+            sleep = target_dt - elapsed
+            if sleep > 0:
+                time.sleep(sleep)
+
+    def _draw_elixir_overlay(self, frame_bgr, candidates, chosen, origin, size):
+        if frame_bgr is None or frame_bgr.size == 0:
+            return frame_bgr
+        h, w = frame_bgr.shape[:2]
+        origin_x, origin_y = origin
+        region_w, region_h = size
+        info_lines = []
+        if chosen:
+            info_lines.append(
+                f"chosen: {chosen.get('value')} ({chosen.get('conf_score', 0):.0f})"
+            )
+        info_lines.append(f"candidates: {len(candidates)}")
+        info_lines.append(f"region: {origin_x},{origin_y} {region_w}x{region_h}")
+        for cand in candidates:
+            left = max(0, cand.get("left", 0))
+            top = max(0, cand.get("top", 0))
+            right = min(w - 1, left + max(1, cand.get("width", 0)))
+            bottom = min(h - 1, top + max(1, cand.get("height", 0)))
+            if left >= w or top >= h:
+                continue
+            color = (230, 120, 60) if chosen and cand.get("value") == chosen.get("value") and cand.get("left") == chosen.get("left") else (80, 80, 80)
+            cv2.rectangle(frame_bgr, (left, top), (right, bottom), color, 2)
+            label = f"{cand.get('value')}"
+            conf_score = cand.get("conf_score")
+            if conf_score is not None:
+                label = f"{label} ({conf_score:.0f})"
+            cv2.putText(
+                frame_bgr,
+                label,
+                (left, max(12, top - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        if not candidates:
+            info_lines.append("no digits found")
+        y0 = 18
+        for line in info_lines:
+            cv2.putText(
+                frame_bgr,
+                line,
+                (8, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (230, 230, 230),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame_bgr,
+                line,
+                (8, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            y0 += 22
+        return frame_bgr
 
     def _schedule_next_emote(self):
         low, high = self._emote_interval_range
@@ -256,9 +433,8 @@ class ClashRoyaleEnv:
         region_width = int(width)
         region_height = int(capture_height)
 
-        try:
-            grab = pyautogui.screenshot(region=(region_left, region_top, region_width, region_height))
-        except Exception:
+        grab = self._capture_region(region_left, region_top, region_width, region_height)
+        if grab is None:
             return None
 
         capture_origin = (region_left, region_top)
@@ -360,104 +536,22 @@ class ClashRoyaleEnv:
             else:
                 best = max(candidates, key=lambda c: c["conf_score"])
 
-        try:
-            self._show_elixir_debug(grab, candidates, best, capture_origin, (region_width, region_height))
-        except Exception:
-            pass
+        self._last_elixir_region = (region_left, region_top, region_width, region_height)
+        self._update_elixir_overlay(candidates, best, capture_origin, (region_width, region_height))
 
         return best["value"] if best else None
 
-    def _show_elixir_debug(self, region_img, candidates, chosen, origin, size):
+    def _update_elixir_overlay(self, candidates, chosen, origin, size):
         if cv2 is None:
-            if not getattr(self, "_elixir_warned", False):
-                print("[ClashRoyaleEnv] Install opencv-python to enable elixir debug window.")
-                self._elixir_warned = True
             return
-        now = time.time()
-        if now < getattr(self, "_next_elixir_debug", 0.0):
-            return
-
-        if not getattr(self, "_elixir_window_created", False):
-            try:
-                cv2.namedWindow(self._elixir_window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(self._elixir_window_name, 420, 150)
-                self._elixir_window_created = True
-            except Exception:
-                if not self._elixir_warned:
-                    print("[ClashRoyaleEnv] Failed to create OpenCV debug window; disabling.")
-                    self._elixir_warned = True
-                return
-        rgb = np.array(region_img.convert("RGB"), dtype=np.uint8)
-        if rgb.ndim == 2:
-            rgb = np.stack([rgb] * 3, axis=-1)
-        frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-
-        h, w = frame_bgr.shape[:2]
-        origin_x, origin_y = origin
-        region_w, region_h = size
-        info_lines = []
-        if chosen:
-            info_lines.append(
-                f"chosen: {chosen['value']} (conf {chosen.get('conf_score', 0):.0f})"
-            )
-        info_lines.append(
-            f"candidates: {len(candidates)}"
-        )
-        info_lines.append(f"region: {origin_x},{origin_y} {region_w}x{region_h}")
-
-        for cand in candidates:
-            left = max(0, cand["left"])
-            top = max(0, cand["top"])
-            right = min(w - 1, left + max(1, cand["width"]))
-            bottom = min(h - 1, top + max(1, cand["height"]))
-            if left >= w or top >= h:
-                continue
-            color = (230, 120, 60) if cand is chosen else (80, 80, 80)
-            cv2.rectangle(frame_bgr, (left, top), (right, bottom), color, 2)
-            label = f"{cand['value']}"
-            if cand.get("conf_score") is not None:
-                label = f"{label} ({cand['conf_score']:.0f})"
-            cv2.putText(
-                frame_bgr,
-                label,
-                (left, max(12, top - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
-
-        if not candidates:
-            info_lines.append("no digits found")
-
-        y0 = 18
-        for line in info_lines:
-            cv2.putText(
-                frame_bgr,
-                line,
-                (8, y0),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (230, 230, 230),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame_bgr,
-                line,
-                (8, y0),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
-            y0 += 22
-
-        cv2.imshow(self._elixir_window_name, frame_bgr)
-        cv2.waitKey(1)
-        self._next_elixir_debug = now + 0.016
+        with self._elixir_overlay_lock:
+            self._elixir_overlay = {
+                "candidates": [dict(c) for c in candidates],
+                "chosen": dict(chosen) if chosen else None,
+                "region_origin": tuple(origin),
+                "region_size": tuple(size),
+                "updated": time.time(),
+            }
 
     # ---------------- Main RL step ----------------
     def step(self, action_index):
