@@ -84,6 +84,7 @@ class ClashRoyaleEnv:
 
         self._emote_interval_range = (15.0, 45.0)
         self._next_emote_time = None
+        self._last_reward = 0.0
 
         # Game window preview (for debugging/duplication)
         self._gw_warned = False
@@ -135,6 +136,8 @@ class ClashRoyaleEnv:
 
         self._last_predictions = []
         self._last_img_size = None
+
+        self._last_reward = 0.0
 
         self._schedule_next_emote()
 
@@ -365,6 +368,7 @@ class ClashRoyaleEnv:
         cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
 
         info_lines = [
+            f"Reward: {self._last_reward:.2f}",
             f"Detections: {len(predictions)}",
             "Hand: " + (", ".join(self._last_hand) if self._last_hand else "unknown"),
         ]
@@ -753,6 +757,7 @@ class ClashRoyaleEnv:
                 reward += 2 * min(elixir_spent, enemy_reduced)
         self.prev_elixir = elixir
         self.prev_enemy_presence = enemy_presence
+        self._last_reward = reward
         return reward
 
     # ---------------- Hand detection ----------------
