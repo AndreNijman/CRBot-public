@@ -14,10 +14,11 @@ CARDS_PT  = f"{MODEL_DIR}/cards.pt"
 TROOPS_PT = f"{MODEL_DIR}/troops.pt"
 TOWERS_PT = f"{MODEL_DIR}/towers.pt"
 
-# Tunables
-CONF_CARDS, CONF_TROOPS, CONF_TOWERS = 0.25, 0.22, 0.22
-IMGSZ_CARDS, IMGSZ_ARENA = 960, 960   # bigger = better for small targets
-DECK_HEIGHT_FRACTION = 0.24           # bottom % of the window for cards ROI
+# Keep cards/towers same as your working version.
+CONF_CARDS, CONF_TROOPS, CONF_TOWERS = 0.25, 0.18, 0.22
+IMGSZ_CARDS, IMGSZ_ARENA = 960, 960
+DECK_HEIGHT_FRACTION = 0.24
+ARENA_SCALE = 2.0  # ONLY used for troops
 WINDOW_NAME = "CR Vision Tester"
 
 cards_model  = YOLO(CARDS_PT)
@@ -50,12 +51,11 @@ def _grab_client_region(mss_obj, rect):
     left, top, right, bottom = rect
     w, h = right - left, bottom - top
     shot = mss_obj.grab({"left": left, "top": top, "width": w, "height": h})
-    # make a contiguous HxWx3 uint8 BGR frame
     return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR).copy()
 
-def _predict(model, frame_bgr, conf, imgsz):
+def _predict(model, frame_bgr, conf, imgsz, augment=False):
     img = Image.fromarray(frame_bgr[:, :, ::-1])
-    r = model.predict(img, conf=conf, imgsz=imgsz, device=0, verbose=False)[0]
+    r = model.predict(img, conf=conf, imgsz=imgsz, device=0, verbose=False, augment=augment)[0]
     out = []
     names = r.names
     boxes = r.boxes
@@ -73,6 +73,11 @@ def _draw(frame, dets, color):
         cv2.putText(frame, f"{label} {score:.2f}", (x1, max(20, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
+def _downscale(dets, sx, sy):
+    invx, invy = 1.0/sx, 1.0/sy
+    return [(lbl, sc, (int(x1*invx), int(y1*invy), int(x2*invx), int(y2*invy)))
+            for (lbl, sc, (x1, y1, x2, y2)) in dets]
+
 def main():
     hwnd, rect = _find_window_rect(TITLE_SUBSTR)
     if not hwnd:
@@ -88,22 +93,27 @@ def main():
             frame = _grab_client_region(sct, rect)
             H, W, _ = frame.shape
 
-            # ---- Cards: run only on bottom strip (deck ROI) ----
+            # ---- Cards: bottom deck ROI (UNCHANGED) ----
             deck_h = int(DECK_HEIGHT_FRACTION * H)
             y0 = max(0, H - deck_h)
             deck_roi = frame[y0:H, 0:W]
-            det_cards = _predict(cards_model, deck_roi, CONF_CARDS, IMGSZ_CARDS)
-            # offset deck boxes back to full frame coords
-            det_cards = [(lbl, sc, (x1, y1 + y0, x2, y2 + y0)) for (lbl, sc, (x1, y1, x2, y2)) in det_cards]
+            det_cards = _predict(cards_model, deck_roi, CONF_CARDS, IMGSZ_CARDS, augment=False)
+            det_cards = [(lbl, sc, (x1, y1 + y0, x2, y2 + y0))
+                         for (lbl, sc, (x1, y1, x2, y2)) in det_cards]
 
-            # ---- Arena: troops + towers on the whole frame ----
-            det_troops = _predict(troops_model, frame, CONF_TROOPS, IMGSZ_ARENA)
-            det_towers = _predict(towers_model, frame, CONF_TOWERS, IMGSZ_ARENA)
+            # ---- Troops: arena-only crop, upscale, predict, downscale back ----
+            arena = frame[0:y0, 0:W]
+            arena_up = cv2.resize(arena, None, fx=ARENA_SCALE, fy=ARENA_SCALE, interpolation=cv2.INTER_LINEAR)
+            det_troops_up = _predict(troops_model, arena_up, CONF_TROOPS, 1280, augment=True)
+            det_troops = _downscale(det_troops_up, ARENA_SCALE, ARENA_SCALE)
+
+            # ---- Towers: FULL FRAME (UNCHANGED) ----
+            det_towers = _predict(towers_model, frame, CONF_TOWERS, IMGSZ_ARENA, augment=False)
 
             # draw
-            _draw(frame, det_cards,  (0, 255, 0))     # green  = cards (deck)
-            _draw(frame, det_troops, (255, 200, 0))   # orange = troops
-            _draw(frame, det_towers, (0, 200, 255))   # cyan   = towers
+            _draw(frame, det_cards,  (0, 255, 0))     # cards
+            _draw(frame, det_troops, (255, 200, 0))   # troops
+            _draw(frame, det_towers, (0, 200, 255))   # towers
 
             # HUD
             dt = max(time.time() - t0, 1e-6)
@@ -112,8 +122,7 @@ def main():
                         (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
 
             cv2.imshow(WINDOW_NAME, frame)
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord('q'):
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
 
     cv2.destroyWindow(WINDOW_NAME)
