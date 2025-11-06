@@ -1,132 +1,125 @@
-from __future__ import annotations
-
-import argparse
+# scripts/live_vision.py
 import time
-from pathlib import Path
-import sys
-
 import cv2
 import numpy as np
-import pyautogui as pag
 from PIL import Image
 from ultralytics import YOLO
+import mss
+import win32gui
+import win32con
+import win32api
 
-THIS_DIR = Path(__file__).resolve().parent
-ROOT_DIR = THIS_DIR.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+TITLE_SUBSTR = "pyclashbot-96"   # exact window title or substring
+MODEL_DIR = "yolo_models"
+CARDS_PT = f"{MODEL_DIR}/cards.pt"
+TROOPS_PT = f"{MODEL_DIR}/troops.pt"
+TOWERS_PT = f"{MODEL_DIR}/towers.pt"
 
-from crbot.config import PROJECT_ROOT
+CONF_CARDS, CONF_TROOPS, CONF_TOWERS = 0.35, 0.30, 0.30
+IMGSZ = 640
+WINDOW_NAME = "CR Vision Tester"
 
-MODEL_DIR = PROJECT_ROOT / "yolo_models"
+# Load models once
+cards_model  = YOLO(CARDS_PT)
+troops_model = YOLO(TROOPS_PT)
+towers_model = YOLO(TOWERS_PT)
 
-MODES = ["cards", "troops", "towers", "arena"]  # arena = troops + towers overlay
+def _find_window_rect(title_substr: str):
+    """Return client-area bbox (left, top, right, bottom) of the first window whose title contains `title_substr`."""
+    target = {"hwnd": None, "title": None}
 
+    def enum_cb(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        t = win32gui.GetWindowText(hwnd)
+        if t and title_substr.lower() in t.lower():
+            target["hwnd"] = hwnd
+            target["title"] = t
 
-def load_models(device: str | int) -> dict[str, YOLO]:
-    return {
-        "cards": YOLO(MODEL_DIR / "cards.pt"),
-        "troops": YOLO(MODEL_DIR / "troops.pt"),
-        "towers": YOLO(MODEL_DIR / "towers.pt"),
-    }
+    win32gui.EnumWindows(enum_cb, None)
+    hwnd = target["hwnd"]
+    if not hwnd:
+        return None, None
 
+    # Bring to front
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
 
-def predict(model: YOLO, frame_bgr: np.ndarray, *, conf: float, imgsz: int, device: str | int):
+    # Client rect in client coords
+    l, t, r, b = win32gui.GetClientRect(hwnd)
+    # Convert client origin to screen coords
+    pt = win32gui.ClientToScreen(hwnd, (0, 0))
+    left, top = pt
+    right, bottom = left + (r - l), top + (b - t)
+    return hwnd, (left, top, right, bottom)
+
+def _grab_client_region(mss_obj: mss.mss, rect):
+    left, top, right, bottom = rect
+    w, h = right - left, bottom - top
+    shot = mss_obj.grab({"left": left, "top": top, "width": w, "height": h})
+    frame = cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR).copy()  # BGRA -> BGR drop A
+    return frame
+
+def _predict(model, frame_bgr, conf):
+    # feed BGR as PIL RGB to Ultralytics
     img = Image.fromarray(frame_bgr[:, :, ::-1])
-    result = model.predict(img, conf=conf, imgsz=imgsz, device=device, verbose=False)[0]
+    r = model.predict(img, conf=conf, imgsz=IMGSZ, device=0, verbose=False)[0]
     dets = []
-    names = result.names
-    for box in result.boxes:
-        x1, y1, x2, y2 = map(float, box.xyxy[0].tolist())
-        cls = int(box.cls[0])
-        score = float(box.conf[0])
-        dets.append((names[cls], score, (int(x1), int(y1), int(x2), int(y2))))
+    names = r.names
+    if r.boxes is None or len(r.boxes) == 0:
+        return dets
+    for b in r.boxes:
+        x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+        cls = int(b.cls[0])
+        score = float(b.conf[0])
+        dets.append((names[cls], score, (x1, y1, x2, y2)))
     return dets
 
-
-def draw_detections(frame, detections, color):
-    for label, score, (x1, y1, x2, y2) in detections:
+def _draw(frame, dets, color):
+    for label, score, (x1, y1, x2, y2) in dets:
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            frame,
-            f"{label} {score:.2f}",
-            (x1, max(20, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(frame, f"{label} {score:.2f}", (x1, max(20, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+def main():
+    hwnd, rect = _find_window_rect(TITLE_SUBSTR)
+    if not hwnd:
+        print(f"Window not found containing title: {TITLE_SUBSTR}")
+        return
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
 
 
-def grab_frame() -> np.ndarray:
-    shot = pag.screenshot()
-    return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live object detection visualiser.")
-    parser.add_argument("--device", default=0, help="YOLO device (GPU index or 'cpu').")
-    return parser.parse_args(argv)
-
-
-def main() -> None:
-    args = parse_args()
-    models = load_models(args.device)
-    mode_idx = 0
     fps = 0.0
+    with mss.mss() as sct:
+        while True:
+            t0 = time.time()
+            frame = _grab_client_region(sct, rect)
 
-    print("Controls: 1=cards  2=troops  3=towers  4=arena  q=quit")
+            # run all three on the same frame
+            det_cards  = _predict(cards_model,  frame, CONF_CARDS)
+            det_troops = _predict(troops_model, frame, CONF_TROOPS)
+            det_towers = _predict(towers_model, frame, CONF_TOWERS)
 
-    while True:
-        frame = grab_frame()
-        start = time.time()
+            # draw all overlays on one frame
+            _draw(frame, det_cards,  (0, 255, 0))     # green  cards
+            _draw(frame, det_troops, (255, 200, 0))   # orange troops
+            _draw(frame, det_towers, (0, 200, 255))   # cyan   towers
 
-        mode = MODES[mode_idx]
-        if mode == "cards":
-            dets = predict(models["cards"], frame, conf=0.35, imgsz=640, device=args.device)
-            draw_detections(frame, dets, (0, 255, 0))
-        elif mode == "troops":
-            dets = predict(models["troops"], frame, conf=0.30, imgsz=640, device=args.device)
-            draw_detections(frame, dets, (255, 200, 0))
-        elif mode == "towers":
-            dets = predict(models["towers"], frame, conf=0.30, imgsz=640, device=args.device)
-            draw_detections(frame, dets, (0, 200, 255))
-        else:
-            d1 = predict(models["troops"], frame, conf=0.30, imgsz=640, device=args.device)
-            d2 = predict(models["towers"], frame, conf=0.30, imgsz=640, device=args.device)
-            draw_detections(frame, d1, (255, 200, 0))
-            draw_detections(frame, d2, (0, 200, 255))
+            dt = max(time.time() - t0, 1e-6)
+            fps = 0.9 * fps + 0.1 * (1.0 / dt)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (12, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-        elapsed = time.time() - start
-        fps = 0.9 * fps + 0.1 * (1.0 / max(elapsed, 1e-6))
+            cv2.imshow(WINDOW_NAME, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
 
-        cv2.putText(
-            frame,
-            f"Mode: {mode}  FPS: {fps:.1f}",
-            (12, 28),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.imshow("CR Vision Tester", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("1"):
-            mode_idx = 0
-        elif key == ord("2"):
-            mode_idx = 1
-        elif key == ord("3"):
-            mode_idx = 2
-        elif key == ord("4"):
-            mode_idx = 3
-
-    cv2.destroyAllWindows()
-
+    cv2.destroyWindow(WINDOW_NAME)
 
 if __name__ == "__main__":
     main()
