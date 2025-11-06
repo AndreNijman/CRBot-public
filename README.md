@@ -59,7 +59,15 @@ A Python-based Clash Royale AI bot that learns and improves through gameplay. Th
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
+## Project Structure
 
+- `crbot/` — Python package containing the environment, automation, training loop, and utilities.
+- `scripts/` — Command-line entry points such as `train_bot.py`, `match_reset.py`, and `live_vision_viewer.py`.
+- `assets/main_images/` — Reference images used by the automation layer.
+- `tests/` — Smoke tests and diagnostics.
+- `legacy/` — Archived snapshots of the previous implementation for reference.
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 <!-- GETTING STARTED -->
 ## Getting Started

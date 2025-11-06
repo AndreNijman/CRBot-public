@@ -4,3 +4,11 @@
 # Python
 __pycache__/
 /debug
+/screenshots
+/logs
+/datasets
+/models
+/runs
+/__pycache__
+screenshots/
+
