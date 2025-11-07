@@ -88,9 +88,32 @@ class DQNAgent:
         path = Path(filename)
         if not path.is_absolute():
             path = MODELS_DIR / path
-        state_dict = torch.load(path)
-        self.model.load_state_dict(state_dict)
+        load_kwargs = {"map_location": "cpu"}
+        try:
+            state_dict = torch.load(path, weights_only=True, **load_kwargs)
+        except TypeError:
+            state_dict = torch.load(path, **load_kwargs)
+        model_state = self.model.state_dict()
+        filtered = {}
+        skipped = []
+        for key, value in state_dict.items():
+            if key in model_state and model_state[key].shape == value.shape:
+                filtered[key] = value
+            else:
+                skipped.append(key)
+        if not filtered:
+            print(f"[DQNAgent] No compatible parameters found in checkpoint {path.name}; starting fresh.")
+            return
+        updated_state = model_state.copy()
+        updated_state.update(filtered)
+        self.model.load_state_dict(updated_state)
         self.model.eval()
+        self.target_model.load_state_dict(self.model.state_dict())
+        if skipped:
+            preview = ", ".join(skipped[:5])
+            if len(skipped) > 5:
+                preview += ", ..."
+            print(f"[DQNAgent] Skipped incompatible params from {path.name}: {preview}")
 
     def save(self, path: str | Path) -> Path:
         path = Path(path)

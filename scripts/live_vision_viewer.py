@@ -12,6 +12,7 @@ TITLE_SUBSTR = "pyclashbot-96"
 MODEL_DIR = "yolo_models"
 CARDS_PT  = f"{MODEL_DIR}/cards.pt"
 ARENA_COMBINED_PT = "runs/arena/train_full_s1280/weights/best.pt"
+IGNORED_CLASSES = {"elixir", "clock", "text"}
 
 # Tunables
 CONF_CARDS, CONF_TROOPS, CONF_TOWERS = 0.25, 0.22, 0.22
@@ -53,7 +54,8 @@ def _grab_client_region(mss_obj, rect):
     # make a contiguous HxWx3 uint8 BGR frame
     return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR).copy()
 
-def _predict(model, frame_bgr, conf, imgsz):
+def _predict(model, frame_bgr, conf, imgsz, ignored=None):
+    ignored = ignored or set()
     img = Image.fromarray(frame_bgr[:, :, ::-1])
     r = model.predict(img, conf=conf, imgsz=imgsz, device=0, verbose=False)[0]
     out = []
@@ -64,7 +66,10 @@ def _predict(model, frame_bgr, conf, imgsz):
     for b in boxes:
         x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
         cls = int(b.cls[0]); score = float(b.conf[0])
-        out.append((names[cls], score, (x1, y1, x2, y2)))
+        label = names[cls]
+        if label.lower() in ignored:
+            continue
+        out.append((label, score, (x1, y1, x2, y2)))
     return out
 
 def _draw(frame, dets, color):
@@ -92,13 +97,13 @@ def main():
             deck_h = int(DECK_HEIGHT_FRACTION * H)
             y0 = max(0, H - deck_h)
             deck_roi = frame[y0:H, 0:W]
-            det_cards = _predict(cards_model, deck_roi, CONF_CARDS, IMGSZ_CARDS)
+            det_cards = _predict(cards_model, deck_roi, CONF_CARDS, IMGSZ_CARDS, IGNORED_CLASSES)
             # offset deck boxes back to full frame coords
             det_cards = [(lbl, sc, (x1, y1 + y0, x2, y2 + y0)) for (lbl, sc, (x1, y1, x2, y2)) in det_cards]
 
             # ---- Arena: troops + towers on the whole frame ----
-            det_troops = _predict(troops_model, frame, CONF_TROOPS, IMGSZ_ARENA)
-            det_towers = _predict(towers_model, frame, CONF_TOWERS, IMGSZ_ARENA)
+            det_troops = _predict(troops_model, frame, CONF_TROOPS, IMGSZ_ARENA, IGNORED_CLASSES)
+            det_towers = _predict(towers_model, frame, CONF_TOWERS, IMGSZ_ARENA, IGNORED_CLASSES)
 
             # draw
             _draw(frame, det_cards,  (0, 255, 0))     # green  = cards (deck)

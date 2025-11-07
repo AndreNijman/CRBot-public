@@ -201,13 +201,20 @@ def train_agent(
                 elixir = _safe_call(env, ("get_elixir",))
                 tower_ocr = env.get_tower_ocr_debug()
                 play_again_detected = find_play_again_center(bbox) is not None
+                outcome = None
+                get_outcome = getattr(env, "get_match_outcome", None)
+                if callable(get_outcome):
+                    outcome = get_outcome()
+                win_flag = finished.is_set()
+                if outcome:
+                    win_flag = outcome == "victory"
 
                 status.set(
                     hand=hand or [],
                     enemy=enemy or [],
                     elixir=elixir,
                     tower_ocr=tower_ocr or status.get().get("tower_ocr"),
-                    win=finished.is_set(),
+                    win=win_flag,
                     play_again=play_again_detected,
                     step=step,
                     epsilon=getattr(agent, "epsilon", 1.0),

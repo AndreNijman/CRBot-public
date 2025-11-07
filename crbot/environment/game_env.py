@@ -10,11 +10,13 @@ from pathlib import Path
 import numpy as np
 import pyautogui
 from dotenv import load_dotenv
-from inference_sdk import InferenceHTTPClient
+import mss
 from PIL import Image, ImageOps, ImageFilter
+from ultralytics import YOLO
 
 from crbot.automation.controller import ActionController
 from crbot.config import DEBUG_DIR, SCREENSHOTS_DIR
+from crbot.vision import has_winner_text, screenshot_region
 
 try:
     import cv2
@@ -43,6 +45,32 @@ load_dotenv()
 MAX_ENEMIES = 10
 MAX_ALLIES  = 10
 SPELL_CARDS = ["Fireball", "Zap", "Arrows", "Tornado", "Rocket", "Lightning", "Freeze"]
+MODEL_DIR = Path("yolo_models")
+CARDS_MODEL_PATH = (MODEL_DIR / "cards.pt").resolve()
+ARENA_MODEL_PATH = Path("runs/arena/train_full_s1280/weights/best.pt").resolve()
+IGNORED_MODEL_CLASSES = {"elixir", "clock", "text"}
+DECK_HEIGHT_FRACTION = 0.24
+WINDOW_NAME = "CR Vision Tester"
+KING_TOWER_LABELS = {"king-tower"}
+PRINCESS_TOWER_LABELS = {
+    "queen-tower",
+    "cannoneer-tower",
+    "dagger-duchess-tower",
+}
+ALLY_REGION_MIN = 0.55
+ENEMY_REGION_MAX = 0.45
+ARENA_IMGSZ = 960
+CARDS_IMGSZ = 960
+ARENA_CONF = 0.25
+CARDS_CONF = 0.25
+
+PRINCESS_TOWER_REWARD = 50.0
+PRINCESS_TOWER_PENALTY = 50.0
+KING_TOWER_REWARD = 150.0
+KING_TOWER_PENALTY = 150.0
+DEFENSE_REWARD_PER_UNIT = 8.0
+WIN_REWARD = 300.0
+LOSS_PENALTY = -300.0
 
 ENV_DEBUG_DIR = str((DEBUG_DIR / "env").resolve())
 os.makedirs(ENV_DEBUG_DIR, exist_ok=True)
@@ -53,8 +81,8 @@ def _nc(s):
 class ClashRoyaleEnv:
     def __init__(self):
         self.actions = ActionController()
-        self.rf_model = self.setup_roboflow()
-        self.card_model = self.setup_card_roboflow()
+        self.arena_model = self._load_yolo_model(ARENA_MODEL_PATH, "arena/troops+towers")
+        self.card_model = self._load_yolo_model(CARDS_MODEL_PATH, "cards")
         self.state_size = 1 + 2 * (MAX_ALLIES + MAX_ENEMIES)
 
         self.num_cards = 4
@@ -73,9 +101,7 @@ class ClashRoyaleEnv:
         self._endgame_thread = None
         self._endgame_thread_stop = threading.Event()
 
-        self.prev_elixir = None
-        self.prev_enemy_presence = None
-        self.prev_enemy_princess_towers = None
+        self.prev_enemy_troops = None
 
         self.match_over_detected = False
 
@@ -91,11 +117,18 @@ class ClashRoyaleEnv:
         self._emote_interval_range = (15.0, 45.0)
         self._next_emote_time = None
         self._last_reward = 0.0
+        self._tower_status = None
+        self._tower_events = {}
+        self._current_enemy_troops = 0
+        self._last_action_desc = "n/a"
+        self._match_outcome = None
+        self._last_window_bbox = None
+        self._detector_frame_origin = (self.actions.TOP_LEFT_X, self.actions.TOP_LEFT_Y)
 
         # Game window preview (for debugging/duplication)
         self._gw_warned = False
         self._window_bbox_warned = False
-        self._window_preview_name = "Game Window Preview"
+        self._window_preview_name = WINDOW_NAME
         self._window_preview_created = False
         self._window_preview_stop = threading.Event()
         self._window_preview_thread = None
@@ -105,17 +138,14 @@ class ClashRoyaleEnv:
             self._start_window_preview_thread()
 
     # ---------------- Roboflow setups ----------------
-    def setup_roboflow(self):
-        api_key = os.getenv('ROBOFLOW_API_KEY')
-        if not api_key:
-            raise ValueError("ROBOFLOW_API_KEY environment variable is not set. Please check your .env file.")
-        return InferenceHTTPClient(api_url="http://localhost:9001", api_key=api_key)
-
-    def setup_card_roboflow(self):
-        api_key = os.getenv('ROBOFLOW_API_KEY')
-        if not api_key:
-            raise ValueError("ROBOFLOW_API_KEY environment variable is not set. Please check your .env file.")
-        return InferenceHTTPClient(api_url="http://localhost:9001", api_key=api_key)
+    def _load_yolo_model(self, path: Path, description: str):
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"{description} model not found at {path}")
+        try:
+            return YOLO(str(path))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load {description} model from {path}: {exc}") from exc
 
     # ---------------- Lifecycle ----------------
     def reset(self):
@@ -127,13 +157,12 @@ class ClashRoyaleEnv:
                 pass
         time.sleep(3)
         self.game_over_flag = None
+        self._match_outcome = None
         self._endgame_thread_stop.clear()
         self._endgame_thread = threading.Thread(target=self._endgame_watcher, daemon=True)
         self._endgame_thread.start()
 
-        self.prev_elixir = None
-        self.prev_enemy_presence = None
-        self.prev_enemy_princess_towers = self._count_enemy_princess_towers()
+        self.prev_enemy_troops = None
         self.match_over_detected = False
 
         self._last_hand = []
@@ -144,6 +173,9 @@ class ClashRoyaleEnv:
         self._last_img_size = None
 
         self._last_reward = 0.0
+        self._tower_status = None
+        self._tower_events = {}
+        self._current_enemy_troops = 0
 
         self._schedule_next_emote()
 
@@ -230,6 +262,44 @@ class ClashRoyaleEnv:
         except Exception:
             return None
 
+    def _capture_window_frame(self):
+        bbox = self._get_game_window_bbox()
+        if not bbox:
+            return None, None
+        left, top, width, height = bbox
+        if width <= 0 or height <= 0:
+            return None, None
+        try:
+            with mss.mss() as sct:
+                shot = sct.grab({"left": int(left), "top": int(top), "width": int(width), "height": int(height)})
+            frame = np.array(shot)
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            return frame, bbox
+        except Exception:
+            pass
+        capture = self._capture_region(left, top, width, height)
+        if capture is None:
+            return None, None
+        return cv2.cvtColor(np.array(capture.convert("RGB")), cv2.COLOR_RGB2BGR), bbox
+
+    def _extract_field_from_frame(self, frame_bgr, bbox):
+        if frame_bgr is None or bbox is None:
+            return None
+        left, top, width, height = bbox
+        fx1 = int(self.actions.TOP_LEFT_X - left)
+        fy1 = int(self.actions.TOP_LEFT_Y - top)
+        fx2 = fx1 + int(self.actions.WIDTH)
+        fy2 = fy1 + int(self.actions.HEIGHT)
+        h, w = frame_bgr.shape[:2]
+        fx1 = max(0, min(w, fx1))
+        fx2 = max(0, min(w, fx2))
+        fy1 = max(0, min(h, fy1))
+        fy2 = max(0, min(h, fy2))
+        if fx2 <= fx1 or fy2 <= fy1:
+            return None
+        return frame_bgr[fy1:fy2, fx1:fx2].copy()
+
     def _start_window_preview_thread(self):
         if cv2 is None or self._window_preview_thread is not None:
             return
@@ -237,6 +307,238 @@ class ClashRoyaleEnv:
         thread = threading.Thread(target=self._window_preview_loop, daemon=True)
         thread.start()
         self._window_preview_thread = thread
+
+    # ---------------- Vision helpers ----------------
+    def _capture_and_process_scene(self, *, record_events: bool = True):
+        frame_bgr, bbox = self._capture_window_frame()
+        origin = (self.actions.TOP_LEFT_X, self.actions.TOP_LEFT_Y)
+        frame_for_detector = None
+        if frame_bgr is not None and bbox is not None:
+            self._last_window_bbox = bbox
+            origin = (bbox[0], bbox[1])
+            field_crop = self._extract_field_from_frame(frame_bgr, bbox)
+            try:
+                target = field_crop if field_crop is not None else frame_bgr
+                Image.fromarray(cv2.cvtColor(target, cv2.COLOR_BGR2RGB)).save(self.screenshot_path)
+            except Exception:
+                pass
+            frame_for_detector = frame_bgr
+        else:
+            self._last_window_bbox = None
+            try:
+                self.actions.capture_area(self.screenshot_path)
+                with Image.open(self.screenshot_path).convert("RGB") as frame:
+                    frame_for_detector = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR)
+            except Exception:
+                return [], (self.actions.WIDTH, self.actions.HEIGHT)
+            origin = (self.actions.TOP_LEFT_X, self.actions.TOP_LEFT_Y)
+            bbox = (origin[0], origin[1], self.actions.WIDTH, self.actions.HEIGHT)
+        if frame_for_detector is None:
+            return [], (self.actions.WIDTH, self.actions.HEIGHT)
+        self._detector_frame_origin = origin
+        frame_rgb = cv2.cvtColor(frame_for_detector, cv2.COLOR_BGR2RGB)
+        pil_frame = Image.fromarray(frame_rgb)
+        detections = self._predict_arena(pil_frame, origin)
+        self._last_predictions = detections
+        self._last_img_size = pil_frame.size
+        self._update_tower_status(detections, record_events=record_events)
+        return detections, pil_frame.size
+
+    def _predict_arena(self, frame: Image.Image, origin):
+        arr = np.array(frame)
+        width, height = frame.size
+        detections = []
+        try:
+            results = self.arena_model.predict(
+                arr,
+                conf=ARENA_CONF,
+                imgsz=ARENA_IMGSZ,
+                verbose=False,
+            )
+        except Exception:
+            return detections
+        r = results[0]
+        boxes = getattr(r, "boxes", None)
+        names = getattr(r, "names", {})
+        if boxes is None:
+            return detections
+        for b in boxes:
+            cls_id = int(b.cls[0])
+            raw_label = names.get(cls_id, str(cls_id))
+            raw_lower = raw_label.lower()
+            if raw_lower in IGNORED_MODEL_CLASSES:
+                continue
+            x1, y1, x2, y2 = map(float, b.xyxy[0].tolist())
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            x_norm = cx / max(width, 1)
+            y_norm = cy / max(height, 1)
+            side = self._infer_side(y_norm)
+            tower_role = self._tower_role_from_label(raw_lower)
+            cls_label = raw_lower
+            if tower_role and side in ("ally", "enemy"):
+                cls_label = f"{side} {tower_role} tower"
+            abs_cx = cx + origin[0]
+            abs_cy = cy + origin[1]
+            abs_x1 = x1 + origin[0]
+            abs_y1 = y1 + origin[1]
+            abs_x2 = x2 + origin[0]
+            abs_y2 = y2 + origin[1]
+            bbox_frame = (x1, y1, x2, y2)
+            bbox_abs = (abs_x1, abs_y1, abs_x2, abs_y2)
+            width_px = max(1.0, x2 - x1)
+            height_px = max(1.0, y2 - y1)
+            detections.append(
+                {
+                    "class": cls_label,
+                    "raw_class": raw_lower,
+                    "x": cx,
+                    "y": cy,
+                    "abs_x": abs_cx,
+                    "abs_y": abs_cy,
+                    "x_norm": x_norm,
+                    "y_norm": y_norm,
+                     "width": width_px,
+                     "height": height_px,
+                     "bbox_frame": bbox_frame,
+                     "bbox_abs": bbox_abs,
+                    "score": float(b.conf[0]),
+                    "side": side,
+                    "tower_role": tower_role,
+                }
+            )
+        return detections
+
+    def _infer_side(self, y_norm: float) -> str | None:
+        if y_norm <= ENEMY_REGION_MAX:
+            return "enemy"
+        if y_norm >= ALLY_REGION_MIN:
+            return "ally"
+        return None
+
+    def _tower_role_from_label(self, label: str) -> str | None:
+        if label in KING_TOWER_LABELS:
+            return "king"
+        if label in PRINCESS_TOWER_LABELS:
+            return "princess"
+        return None
+
+    def _update_tower_status(self, detections, *, record_events: bool):
+        counts = {
+            "ally": {"king": 0, "princess": 0},
+            "enemy": {"king": 0, "princess": 0},
+        }
+        princess_scores = {"ally": [], "enemy": []}
+        king_scores = {"ally": [], "enemy": []}
+        for det in detections or []:
+            role = det.get("tower_role")
+            side = det.get("side")
+            if role is None or side not in ("ally", "enemy"):
+                continue
+            if role == "king":
+                king_scores[side].append(det)
+            else:
+                princess_scores[side].append(det)
+        for side in ("ally", "enemy"):
+            if king_scores[side]:
+                counts[side]["king"] = 1
+            counts[side]["princess"] = min(2, len(princess_scores[side]))
+        if not record_events or self._tower_status is None:
+            self._tower_status = counts
+            if record_events:
+                self._tower_events = {}
+            return
+        prev = self._tower_status
+        events = {
+            "enemy_princess_destroyed": max(0, prev["enemy"]["princess"] - counts["enemy"]["princess"]),
+            "enemy_king_destroyed": max(0, prev["enemy"]["king"] - counts["enemy"]["king"]),
+            "ally_princess_lost": max(0, prev["ally"]["princess"] - counts["ally"]["princess"]),
+            "ally_king_lost": max(0, prev["ally"]["king"] - counts["ally"]["king"]),
+        }
+        self._tower_events = events
+        self._tower_status = counts
+
+    def _predict_cards_for_viewer(self, frame_bgr):
+        if self.card_model is None or frame_bgr is None:
+            return []
+        H, W, _ = frame_bgr.shape
+        deck_h = int(DECK_HEIGHT_FRACTION * H)
+        if deck_h <= 0:
+            return []
+        y0 = max(0, H - deck_h)
+        deck_roi = frame_bgr[y0:H, 0:W]
+        try:
+            img = Image.fromarray(deck_roi[:, :, ::-1])
+        except Exception:
+            return []
+        try:
+            results = self.card_model.predict(
+                img,
+                conf=CARDS_CONF,
+                imgsz=CARDS_IMGSZ,
+                verbose=False,
+            )
+        except Exception:
+            return []
+        r = results[0]
+        boxes = getattr(r, "boxes", None)
+        names = getattr(r, "names", {})
+        card_dets = []
+        if boxes is None:
+            return card_dets
+        for b in boxes:
+            cls_id = int(b.cls[0])
+            label = names.get(cls_id, str(cls_id))
+            if label.lower() in IGNORED_MODEL_CLASSES:
+                continue
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            y1 += y0
+            y2 += y0
+            card_dets.append(
+                {
+                    "label": label,
+                    "score": float(b.conf[0]),
+                    "bbox": (max(0, x1), max(0, y1), min(W - 1, x2), min(H - 1, y2)),
+                }
+            )
+        return card_dets
+
+    def _gather_viewer_detections(self, frame_bgr, bbox):
+        viewer = {"cards": [], "troops": [], "towers": []}
+        if frame_bgr is None or bbox is None:
+            return viewer
+        cards = self._predict_cards_for_viewer(frame_bgr)
+        viewer["cards"] = cards
+        for det in self._last_predictions or []:
+            bbox_det = det.get("bbox_frame")
+            if not bbox_det:
+                continue
+            x1, y1, x2, y2 = bbox_det
+            entry = {
+                "label": det.get("raw_class") or det.get("class") or "unknown",
+                "score": det.get("score"),
+                "bbox": (x1, y1, x2, y2),
+            }
+            if det.get("tower_role"):
+                viewer["towers"].append(entry)
+            else:
+                viewer["troops"].append(entry)
+        return viewer
+
+    def _determine_outcome_from_towers(self) -> str:
+        if self._tower_status is None:
+            self._capture_and_process_scene(record_events=False)
+        ally = self._tower_status or {"ally": {"king": 0, "princess": 0}, "enemy": {"king": 0, "princess": 0}}
+        ally_total = ally["ally"]["king"] + ally["ally"]["princess"]
+        enemy_total = ally["enemy"]["king"] + ally["enemy"]["princess"]
+        if ally_total > enemy_total:
+            return "victory"
+        if ally_total < enemy_total:
+            return "defeat"
+        return "defeat"
+
+    def get_match_outcome(self) -> str | None:
+        return self._match_outcome
 
     def _window_preview_loop(self):
         if cv2 is None:
@@ -257,14 +559,9 @@ class ClashRoyaleEnv:
 
         while not self._window_preview_stop.is_set():
             start = time.time()
-            bbox = self._get_game_window_bbox()
-            frame = None
-            if bbox:
-                left, top, width, height = bbox
-                capture = self._capture_region(left, top, width, height)
-                if capture is not None:
-                    frame = cv2.cvtColor(np.array(capture.convert("RGB")), cv2.COLOR_RGB2BGR)
-                    frame = self._annotate_window_frame(frame, bbox)
+            frame, bbox = self._capture_window_frame()
+            if frame is not None:
+                frame = self._annotate_window_frame(frame, bbox)
             if frame is None:
                 frame = blank.copy()
             h, w = frame.shape[:2]
@@ -295,87 +592,32 @@ class ClashRoyaleEnv:
 
         annotated = frame_bgr.copy()
         height, width = annotated.shape[:2]
-        left, top, _, _ = bbox
-
         overlay = annotated.copy()
+        viewer = self._gather_viewer_detections(frame_bgr, bbox)
 
-        # Draw detections
-        field_offset_x = self.actions.TOP_LEFT_X - left
-        field_offset_y = self.actions.TOP_LEFT_Y - top
-        predictions = self._last_predictions or []
-        for pred in predictions:
-            if not isinstance(pred, dict):
-                continue
-            try:
-                cx = float(pred.get("x", 0))
-                cy = float(pred.get("y", 0))
-                w = float(pred.get("width", 0))
-                h = float(pred.get("height", 0))
-            except (TypeError, ValueError):
-                continue
-            if w <= 0 or h <= 0:
-                continue
-            x0 = int(field_offset_x + cx - w / 2)
-            y0 = int(field_offset_y + cy - h / 2)
-            x1 = int(field_offset_x + cx + w / 2)
-            y1 = int(field_offset_y + cy + h / 2)
-            x0 = max(0, min(width - 1, x0))
-            y0 = max(0, min(height - 1, y0))
-            x1 = max(0, min(width - 1, x1))
-            y1 = max(0, min(height - 1, y1))
-            if x1 <= x0 or y1 <= y0:
-                continue
-            cls = pred.get("class", "unknown")
-            score = pred.get("confidence", pred.get("confidence_score", ""))
-            label = cls
-            if isinstance(score, (int, float)):
-                label = f"{cls} ({score:.2f})"
-            cls_lower = cls.lower() if isinstance(cls, str) else ""
-            if "enemy" in cls_lower:
-                color = (40, 40, 230)
-            elif "ally" in cls_lower:
-                color = (40, 200, 40)
-            else:
-                color = (60, 200, 200)
-            cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
-            cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
-            text_origin = (x0 + 4, max(16, y0 + 16))
-            self._draw_label_with_bg(annotated, label, text_origin, color)
-
-        # Draw card bar annotations
-        card_left = self.actions.CARD_BAR_X - left
-        card_top = self.actions.CARD_BAR_Y - top
-        card_w = self.actions.CARD_BAR_WIDTH
-        card_h = self.actions.CARD_BAR_HEIGHT
-        if card_w > 0 and card_h > 0:
-            x0 = max(0, min(width - 1, int(card_left)))
-            y0 = max(0, min(height - 1, int(card_top)))
-            x1 = max(0, min(width - 1, int(card_left + card_w)))
-            y1 = max(0, min(height - 1, int(card_top + card_h)))
-            if x1 > x0 and y1 > y0:
-                base_color = (0, 180, 255)
-                cv2.rectangle(overlay, (x0, y0), (x1, y1), base_color, -1)
-                cv2.rectangle(annotated, (x0, y0), (x1, y1), base_color, 2)
-                slot_width = card_w / max(1, self.num_cards)
-                cards = self._last_hand or []
-                for idx, card_name in enumerate(cards):
-                    sx0 = int(card_left + idx * slot_width)
-                    sx1 = int(card_left + (idx + 1) * slot_width)
-                    sx0 = max(0, min(width - 1, sx0))
-                    sx1 = max(0, min(width - 1, sx1))
-                    if sx1 <= sx0:
-                        continue
-                    cv2.rectangle(overlay, (sx0, y0), (sx1, y1), base_color, -1)
-                    cv2.rectangle(annotated, (sx0, y0), (sx1, y1), base_color, 1)
-                    text = str(card_name)
-                    text_pos = (sx0 + 4, min(height - 6, y1 - 6))
-                    self._draw_label_with_bg(annotated, text, text_pos, base_color, scale=0.45)
+        self._draw_detection_boxes(annotated, overlay, viewer["cards"], (0, 255, 0))
+        self._draw_detection_boxes(annotated, overlay, viewer["troops"], (255, 200, 0))
+        self._draw_detection_boxes(annotated, overlay, viewer["towers"], (0, 200, 255))
 
         cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
 
+        ally_towers = 0
+        enemy_towers = 0
+        if self._tower_status:
+            ally = self._tower_status.get("ally", {})
+            enemy = self._tower_status.get("enemy", {})
+            ally_towers = ally.get("king", 0) + ally.get("princess", 0)
+            enemy_towers = enemy.get("king", 0) + enemy.get("princess", 0)
+        cards_cnt = len(viewer["cards"])
+        troops_cnt = len(viewer["troops"])
+        towers_cnt = len(viewer["towers"])
         info_lines = [
             f"Reward: {self._last_reward:.2f}",
-            f"Detections: {len(predictions)}",
+            f"Enemy troops: {self._current_enemy_troops}",
+            f"Towers A:{ally_towers} E:{enemy_towers}",
+            f"Detections cards:{cards_cnt} troops:{troops_cnt} towers:{towers_cnt}",
+            f"Last action: {self._last_action_desc}",
+            f"Outcome: {self._match_outcome or 'playing'}",
             "Hand: " + (", ".join(self._last_hand) if self._last_hand else "unknown"),
         ]
         y = 20
@@ -384,6 +626,25 @@ class ClashRoyaleEnv:
             y += 22
 
         return annotated
+
+    def _draw_detection_boxes(self, annotated, overlay, detections, color):
+        for det in detections or []:
+            bbox = det.get("bbox")
+            if not bbox:
+                continue
+            x1, y1, x2, y2 = bbox
+            x1 = max(0, min(annotated.shape[1] - 1, int(x1)))
+            y1 = max(0, min(annotated.shape[0] - 1, int(y1)))
+            x2 = max(0, min(annotated.shape[1] - 1, int(x2)))
+            y2 = max(0, min(annotated.shape[0] - 1, int(y2)))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            label = det.get("label", "object")
+            score = det.get("score")
+            if isinstance(score, (int, float)):
+                label = f"{label} {score:.2f}"
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+            self._draw_label_with_bg(annotated, label, (x1 + 4, max(16, y1 - 6)), color, scale=0.55)
 
     def _draw_label_with_bg(self, img, text, org, color, scale=0.55):
         if cv2 is None:
@@ -451,14 +712,15 @@ class ClashRoyaleEnv:
         self._maybe_trigger_emote()
 
         if self.game_over_flag:
-            done = True
-            reward = self._compute_reward(self._get_state())
-            if self.game_over_flag == "victory":
-                reward += 100
-            elif self.game_over_flag == "defeat":
-                reward -= 100
+            outcome = self.game_over_flag
+            final_state = self._get_state()
+            reward = self._compute_reward(final_state)
+            if outcome == "victory":
+                reward += WIN_REWARD
+            else:
+                reward += LOSS_PENALTY
             self.match_over_detected = False
-            return self._get_state(), reward, done
+            return final_state, reward, True
 
         self.current_cards = self.detect_cards_in_hand()
 
@@ -473,10 +735,11 @@ class ClashRoyaleEnv:
             if not locked:
                 pyautogui.moveTo(1611, 831, duration=0.2)
                 pyautogui.click()
-            next_state = self._get_state()
-            return next_state, 0, False
+            state = self._get_state()
+            return state, 0.0, False
 
         card_index, x_frac, y_frac = self.available_actions[action_index]
+        self._last_action_desc = self._describe_action(action_index, card_index, x_frac, y_frac)
 
         if card_index != -1 and card_index < len(self.current_cards):
             x = int(x_frac * self.actions.WIDTH) + self.actions.TOP_LEFT_X
@@ -484,87 +747,71 @@ class ClashRoyaleEnv:
             self.actions.card_play(x, y, card_index)
             time.sleep(1)
 
-        current_enemy_princess_towers = self._count_enemy_princess_towers()
-        princess_tower_reward = 0
-        if self.prev_enemy_princess_towers is not None and current_enemy_princess_towers < self.prev_enemy_princess_towers:
-            princess_tower_reward = 20
-        self.prev_enemy_princess_towers = current_enemy_princess_towers
-
-        done = False
-        reward = self._compute_reward(self._get_state()) + princess_tower_reward
         next_state = self._get_state()
-        return next_state, reward, done
+        reward = self._compute_reward(next_state)
+        return next_state, reward, False
+
+    def _describe_action(self, action_index, card_index, x_frac, y_frac):
+        if card_index == -1:
+            return f"{action_index}: no-op"
+        card_name = "Unknown"
+        if 0 <= card_index < len(self.current_cards):
+            card_name = self.current_cards[card_index]
+        return f"{action_index}: {card_name} -> ({x_frac:.2f}, {y_frac:.2f})"
 
     # ---------------- State construction ----------------
     def _get_state(self):
-        self.actions.capture_area(self.screenshot_path)
-        self._last_elixir = None
-
-        ws = os.getenv('WORKSPACE_TROOP_DETECTION')
-        if not ws:
-            raise ValueError("WORKSPACE_TROOP_DETECTION env var is not set.")
-
-        results = self.rf_model.run_workflow(
-            workspace_name=ws,
-            workflow_id="detect-count-and-visualize",
-            images={"image": self.screenshot_path}
-        )
-
-        predictions = []
-        if isinstance(results, dict) and "predictions" in results:
-            predictions = results["predictions"]
-        elif isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict) and "predictions" in first:
-                predictions = first["predictions"]
-
-        # cache for tower OCR
-        self._last_predictions = predictions or []
         try:
-            with Image.open(self.screenshot_path) as im:
-                self._last_img_size = im.size  # (W, H)
+            elixir = self.actions.count_elixir()
         except Exception:
-            self._last_img_size = (self.actions.WIDTH, self.actions.HEIGHT)
+            elixir = None
+        self._last_elixir = int(elixir) if isinstance(elixir, (int, float)) else None
+        detections, img_size = self._capture_and_process_scene(record_events=True)
+        return self._build_state_from_detections(detections, img_size)
 
-        # Build state vectors
-        if not predictions:
-            ally_flat = [0.0] * (2 * MAX_ALLIES)
-            enemy_flat = [0.0] * (2 * MAX_ENEMIES)
-            return np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
-
-        TOWERS = {"ally king tower","ally princess tower","enemy king tower","enemy princess tower"}
-
-        allies, enemies, enemy_names = [], [], []
-        for p in predictions:
-            if not isinstance(p, dict): 
+    def _build_state_from_detections(self, detections, img_size):
+        width, height = img_size
+        allies, enemies = [], []
+        enemy_names = []
+        enemy_troops = 0
+        towers_alias = {"ally king tower", "ally princess tower", "enemy king tower", "enemy princess tower"}
+        field_left = self.actions.TOP_LEFT_X
+        field_top = self.actions.TOP_LEFT_Y
+        field_right = field_left + self.actions.WIDTH
+        field_bottom = field_top + self.actions.HEIGHT
+        for det in detections or []:
+            cls = _nc(det.get("class"))
+            if cls in towers_alias:
                 continue
-            cls_raw = p.get("class",""); cls = _nc(cls_raw)
-            if cls in TOWERS: 
+            abs_x = det.get("abs_x")
+            abs_y = det.get("abs_y")
+            if abs_x is None or abs_y is None:
                 continue
-            x = p.get("x"); y = p.get("y")
-            if x is None or y is None: 
+            if not (field_left <= abs_x <= field_right and field_top <= abs_y <= field_bottom):
                 continue
-            if cls.startswith("ally"):
-                allies.append((x,y))
-            elif cls.startswith("enemy"):
-                enemies.append((x,y))
-                enemy_names.append(cls.replace("enemy ","",1) if cls.startswith("enemy ") else (cls_raw or "enemy"))
+            x_norm = (abs_x - field_left) / float(self.actions.WIDTH)
+            y_norm = (abs_y - field_top) / float(self.actions.HEIGHT)
+            x_norm = max(0.0, min(1.0, x_norm))
+            y_norm = max(0.0, min(1.0, y_norm))
+            side = det.get("side")
+            if side == "ally":
+                allies.append((x_norm, y_norm))
             else:
-                enemies.append((x,y))
-                enemy_names.append(cls_raw if cls_raw else "unknown")
-
+                enemies.append((x_norm, y_norm))
+                enemy_names.append(det.get("raw_class", cls) or "enemy")
+                if side in ("enemy", None):
+                    enemy_troops += 1
         self._last_enemy = enemy_names
+        self._current_enemy_troops = enemy_troops
 
-        def norm(units): 
-            return [(x / self.actions.WIDTH, y / self.actions.HEIGHT) for x,y in units]
-        def pad(units, n):
-            units = norm(units)
-            if len(units) < n: 
-                units += [(0.0,0.0)] * (n - len(units))
-            return units[:n]
+        def pad(units, limit):
+            units = units[:limit]
+            if len(units) < limit:
+                units = units + [(0.0, 0.0)] * (limit - len(units))
+            return units
 
-        ally_flat  = [c for pos in pad(allies, MAX_ALLIES)  for c in pos]
-        enemy_flat = [c for pos in pad(enemies, MAX_ENEMIES) for c in pos]
+        ally_flat = [coord for pair in pad(allies, MAX_ALLIES) for coord in pair]
+        enemy_flat = [coord for pair in pad(enemies, MAX_ENEMIES) for coord in pair]
         return np.array([(self._last_elixir or 0) / 10.0] + ally_flat + enemy_flat, dtype=np.float32)
 
     # ---------------- Big OCR boxes anchored on tower detections ----------------
@@ -598,7 +845,10 @@ class ClashRoyaleEnv:
 
         for side, rois in (("enemy", rois_enemy), ("ally", rois_ally)):
             for slot, box in rois.items():
-                crop = img.crop(box)
+                local = self._field_local_box(box, img.size)
+                if not local:
+                    continue
+                crop = img.crop(local)
                 # save crop for debugging
                 stamp = int(time.time() * 1000)
                 crop_path = os.path.join(ENV_DEBUG_DIR, f"{side}_{slot}_{stamp}.png")
@@ -630,7 +880,8 @@ class ClashRoyaleEnv:
             if not isinstance(p, dict):
                 continue
             cls = _nc(p.get("class",""))
-            x = p.get("x"); y = p.get("y")
+            x = p.get("abs_x", p.get("x"))
+            y = p.get("abs_y", p.get("y"))
             if x is None or y is None:
                 continue
             if cls == "ally princess tower":
@@ -711,6 +962,25 @@ class ClashRoyaleEnv:
             "princess_right": (right_x1, y1, right_x2, y2),
         }
 
+    def _field_local_box(self, box, img_size):
+        if not box:
+            return None
+        W, H = img_size
+        L = self.actions.TOP_LEFT_X
+        T = self.actions.TOP_LEFT_Y
+        x1, y1, x2, y2 = box
+        x1 -= L
+        x2 -= L
+        y1 -= T
+        y2 -= T
+        x1 = max(0, min(W, int(x1)))
+        x2 = max(0, min(W, int(x2)))
+        y1 = max(0, min(H, int(y1)))
+        y2 = max(0, min(H, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
     def _ocr_all_numbers(self, crop_img):
         """
         Return every integer detected in the crop using two passes (binarized + gray),
@@ -751,18 +1021,23 @@ class ClashRoyaleEnv:
     # ---------------- Reward ----------------
     def _compute_reward(self, state):
         if state is None:
-            return 0
-        elixir = state[0] * 10
-        enemy_positions = state[1 + 2 * MAX_ALLIES:]
-        enemy_presence = sum(enemy_positions[1::2])
-        reward = -enemy_presence
-        if self.prev_elixir is not None and self.prev_enemy_presence is not None:
-            elixir_spent = self.prev_elixir - elixir
-            enemy_reduced = self.prev_enemy_presence - enemy_presence
-            if elixir_spent > 0 and enemy_reduced > 0:
-                reward += 2 * min(elixir_spent, enemy_reduced)
-        self.prev_elixir = elixir
-        self.prev_enemy_presence = enemy_presence
+            return 0.0
+        events = self._tower_events or {}
+        reward = 0.0
+        reward += events.get("enemy_princess_destroyed", 0) * PRINCESS_TOWER_REWARD
+        reward += events.get("enemy_king_destroyed", 0) * KING_TOWER_REWARD
+        reward -= events.get("ally_princess_lost", 0) * PRINCESS_TOWER_PENALTY
+        reward -= events.get("ally_king_lost", 0) * KING_TOWER_PENALTY
+
+        defense_bonus = 0.0
+        if self.prev_enemy_troops is not None and self._current_enemy_troops is not None:
+            diff = self.prev_enemy_troops - self._current_enemy_troops
+            if diff > 0:
+                defense_bonus = diff * DEFENSE_REWARD_PER_UNIT
+        reward += defense_bonus
+
+        self.prev_enemy_troops = self._current_enemy_troops
+        self._tower_events = {}
         self._last_reward = reward
         return reward
 
@@ -770,26 +1045,40 @@ class ClashRoyaleEnv:
     def detect_cards_in_hand(self):
         try:
             card_paths = self.actions.capture_individual_cards()
-            cards = []
-            ws = os.getenv('WORKSPACE_CARD_DETECTION')
-            if not ws:
-                raise ValueError("WORKSPACE_CARD_DETECTION env var is not set.")
-            for card_path in card_paths:
-                results = self.card_model.run_workflow(
-                    workspace_name=ws,
-                    workflow_id="custom-workflow",
-                    images={"image": card_path}
-                )
-                predictions = []
-                if isinstance(results, list) and results:
-                    preds_dict = results[0].get("predictions", {})
-                    if isinstance(preds_dict, dict):
-                        predictions = preds_dict.get("predictions", [])
-                cards.append(predictions[0].get("class", "Unknown") if predictions else "Unknown")
-            self._last_hand = list(cards)
-            return cards
         except Exception:
             return []
+        detected = []
+        for path in card_paths:
+            best_label = "Unknown"
+            best_conf = -1.0
+            try:
+                results = self.card_model.predict(
+                    str(path),
+                    conf=CARDS_CONF,
+                    imgsz=CARDS_IMGSZ,
+                    verbose=False,
+                )
+            except Exception:
+                detected.append(best_label)
+                continue
+            r = results[0]
+            boxes = getattr(r, "boxes", None)
+            names = getattr(r, "names", {})
+            if boxes is None:
+                detected.append(best_label)
+                continue
+            for b in boxes:
+                cls_id = int(b.cls[0])
+                label = names.get(cls_id, str(cls_id))
+                if label.lower() in IGNORED_MODEL_CLASSES:
+                    continue
+                conf = float(b.conf[0])
+                if conf > best_conf:
+                    best_conf = conf
+                    best_label = label
+            detected.append(best_label)
+        self._last_hand = list(detected)
+        return detected
 
     # ---------------- Action space ----------------
     def get_available_actions(self):
@@ -804,35 +1093,26 @@ class ClashRoyaleEnv:
 
     # ---------------- Endgame watcher ----------------
     def _endgame_watcher(self):
-        """Safe stub: don't crash if detect_game_end is missing."""
+        """Continuously scan for the WINNER banner and infer outcome from tower counts."""
+        bbox = None
         while not self._endgame_thread_stop.is_set():
+            if bbox is None:
+                bbox = self._get_game_window_bbox()
+                if bbox is None:
+                    time.sleep(0.5)
+                    continue
             try:
-                fn = getattr(self.actions, "detect_game_end", None)
-                result = fn() if callable(fn) else None
-                if result:
-                    self.game_over_flag = result
-                    break
+                shot = screenshot_region(bbox)
             except Exception:
-                pass
-            time.sleep(0.1)
-
-    # ---------------- Princess towers ----------------
-    def _count_enemy_princess_towers(self):
-        self.actions.capture_area(self.screenshot_path)
-        ws = os.getenv('WORKSPACE_TROOP_DETECTION')
-        results = self.rf_model.run_workflow(
-            workspace_name=ws,
-            workflow_id="detect-count-and-visualize",
-            images={"image": self.screenshot_path}
-        )
-        predictions = []
-        if isinstance(results, dict) and "predictions" in results:
-            predictions = results["predictions"]
-        elif isinstance(results, list) and results:
-            first = results[0]
-            if isinstance(first, dict) and "predictions" in first:
-                predictions = first["predictions"]
-        return sum(1 for p in predictions if isinstance(p, dict) and p.get("class") == "enemy princess tower")
+                bbox = None
+                time.sleep(0.5)
+                continue
+            if shot and has_winner_text(shot):
+                outcome = self._determine_outcome_from_towers()
+                self.game_over_flag = outcome
+                self._match_outcome = outcome
+                break
+            time.sleep(0.3)
 
     # ---------------- Getters for web UI ----------------
     def get_current_hand(self):
