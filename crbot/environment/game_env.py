@@ -458,73 +458,6 @@ class ClashRoyaleEnv:
         self._tower_events = events
         self._tower_status = counts
 
-    def _predict_cards_for_viewer(self, frame_bgr):
-        if self.card_model is None or frame_bgr is None:
-            return []
-        H, W, _ = frame_bgr.shape
-        deck_h = int(DECK_HEIGHT_FRACTION * H)
-        if deck_h <= 0:
-            return []
-        y0 = max(0, H - deck_h)
-        deck_roi = frame_bgr[y0:H, 0:W]
-        try:
-            img = Image.fromarray(deck_roi[:, :, ::-1])
-        except Exception:
-            return []
-        try:
-            results = self.card_model.predict(
-                img,
-                conf=CARDS_CONF,
-                imgsz=CARDS_IMGSZ,
-                verbose=False,
-            )
-        except Exception:
-            return []
-        r = results[0]
-        boxes = getattr(r, "boxes", None)
-        names = getattr(r, "names", {})
-        card_dets = []
-        if boxes is None:
-            return card_dets
-        for b in boxes:
-            cls_id = int(b.cls[0])
-            label = names.get(cls_id, str(cls_id))
-            if label.lower() in IGNORED_MODEL_CLASSES:
-                continue
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            y1 += y0
-            y2 += y0
-            card_dets.append(
-                {
-                    "label": label,
-                    "score": float(b.conf[0]),
-                    "bbox": (max(0, x1), max(0, y1), min(W - 1, x2), min(H - 1, y2)),
-                }
-            )
-        return card_dets
-
-    def _gather_viewer_detections(self, frame_bgr, bbox):
-        viewer = {"cards": [], "troops": [], "towers": []}
-        if frame_bgr is None or bbox is None:
-            return viewer
-        cards = self._predict_cards_for_viewer(frame_bgr)
-        viewer["cards"] = cards
-        for det in self._last_predictions or []:
-            bbox_det = det.get("bbox_frame")
-            if not bbox_det:
-                continue
-            x1, y1, x2, y2 = bbox_det
-            entry = {
-                "label": det.get("raw_class") or det.get("class") or "unknown",
-                "score": det.get("score"),
-                "bbox": (x1, y1, x2, y2),
-            }
-            if det.get("tower_role"):
-                viewer["towers"].append(entry)
-            else:
-                viewer["troops"].append(entry)
-        return viewer
-
     def _determine_outcome_from_towers(self) -> str:
         if self._tower_status is None:
             self._capture_and_process_scene(record_events=False)
@@ -593,11 +526,69 @@ class ClashRoyaleEnv:
         annotated = frame_bgr.copy()
         height, width = annotated.shape[:2]
         overlay = annotated.copy()
-        viewer = self._gather_viewer_detections(frame_bgr, bbox)
+        window_left, window_top, _, _ = bbox
 
-        self._draw_detection_boxes(annotated, overlay, viewer["cards"], (0, 255, 0))
-        self._draw_detection_boxes(annotated, overlay, viewer["troops"], (255, 200, 0))
-        self._draw_detection_boxes(annotated, overlay, viewer["towers"], (0, 200, 255))
+        detections = self._last_predictions or []
+        for det in detections:
+            bbox_abs = det.get("bbox_abs")
+            bbox_frame = det.get("bbox_frame")
+            if bbox_abs:
+                x1 = int(bbox_abs[0] - window_left)
+                y1 = int(bbox_abs[1] - window_top)
+                x2 = int(bbox_abs[2] - window_left)
+                y2 = int(bbox_abs[3] - window_top)
+            elif bbox_frame:
+                x1, y1, x2, y2 = map(int, bbox_frame)
+            else:
+                continue
+            x1 = max(0, min(width - 1, x1))
+            y1 = max(0, min(height - 1, y1))
+            x2 = max(0, min(width - 1, x2))
+            y2 = max(0, min(height - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cls = det.get("class", "unknown")
+            label = det.get("raw_class") or cls
+            score = det.get("score")
+            if isinstance(score, (int, float)):
+                label = f"{label} {score:.2f}"
+            color = (60, 200, 200)
+            side = det.get("side")
+            if det.get("tower_role"):
+                color = (0, 200, 255)
+            elif side == "ally":
+                color = (0, 255, 0)
+            elif side == "enemy":
+                color = (255, 200, 0)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+            self._draw_label_with_bg(annotated, label, (x1 + 4, max(16, y1 - 6)), color, scale=0.55)
+
+        card_left = self.actions.CARD_BAR_X - window_left
+        card_top = self.actions.CARD_BAR_Y - window_top
+        card_w = self.actions.CARD_BAR_WIDTH
+        card_h = self.actions.CARD_BAR_HEIGHT
+        if card_w > 0 and card_h > 0:
+            x0 = max(0, min(width - 1, int(card_left)))
+            y0 = max(0, min(height - 1, int(card_top)))
+            x1 = max(0, min(width - 1, int(card_left + card_w)))
+            y1 = max(0, min(height - 1, int(card_top + card_h)))
+            if x1 > x0 and y1 > y0:
+                base_color = (0, 180, 255)
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), base_color, 1)
+                slot_width = card_w / max(1, self.num_cards)
+                cards = self._last_hand or []
+                for idx in range(self.num_cards):
+                    sx0 = int(card_left + idx * slot_width)
+                    sx1 = int(card_left + (idx + 1) * slot_width)
+                    sx0 = max(0, min(width - 1, sx0))
+                    sx1 = max(0, min(width - 1, sx1))
+                    if sx1 <= sx0:
+                        continue
+                    cv2.rectangle(overlay, (sx0, y0), (sx1, y1), base_color, 1)
+                    if idx < len(cards):
+                        text = str(cards[idx])
+                        text_pos = (sx0 + 4, min(height - 6, y1 - 6))
+                        self._draw_label_with_bg(annotated, text, text_pos, base_color, scale=0.45)
 
         cv2.addWeighted(overlay, 0.25, annotated, 0.75, 0, annotated)
 
@@ -608,14 +599,10 @@ class ClashRoyaleEnv:
             enemy = self._tower_status.get("enemy", {})
             ally_towers = ally.get("king", 0) + ally.get("princess", 0)
             enemy_towers = enemy.get("king", 0) + enemy.get("princess", 0)
-        cards_cnt = len(viewer["cards"])
-        troops_cnt = len(viewer["troops"])
-        towers_cnt = len(viewer["towers"])
         info_lines = [
             f"Reward: {self._last_reward:.2f}",
             f"Enemy troops: {self._current_enemy_troops}",
             f"Towers A:{ally_towers} E:{enemy_towers}",
-            f"Detections cards:{cards_cnt} troops:{troops_cnt} towers:{towers_cnt}",
             f"Last action: {self._last_action_desc}",
             f"Outcome: {self._match_outcome or 'playing'}",
             "Hand: " + (", ".join(self._last_hand) if self._last_hand else "unknown"),
@@ -626,25 +613,6 @@ class ClashRoyaleEnv:
             y += 22
 
         return annotated
-
-    def _draw_detection_boxes(self, annotated, overlay, detections, color):
-        for det in detections or []:
-            bbox = det.get("bbox")
-            if not bbox:
-                continue
-            x1, y1, x2, y2 = bbox
-            x1 = max(0, min(annotated.shape[1] - 1, int(x1)))
-            y1 = max(0, min(annotated.shape[0] - 1, int(y1)))
-            x2 = max(0, min(annotated.shape[1] - 1, int(x2)))
-            y2 = max(0, min(annotated.shape[0] - 1, int(y2)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            label = det.get("label", "object")
-            score = det.get("score")
-            if isinstance(score, (int, float)):
-                label = f"{label} {score:.2f}"
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-            self._draw_label_with_bg(annotated, label, (x1 + 4, max(16, y1 - 6)), color, scale=0.55)
 
     def _draw_label_with_bg(self, img, text, org, color, scale=0.55):
         if cv2 is None:
