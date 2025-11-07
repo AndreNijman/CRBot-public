@@ -1,224 +1,215 @@
-<!-- PROJECT LOGO -->
-<h3 align="center">Clash Royale Bot</h3>
+# CRBot – Clash Royale Reinforcement Learning Bot
 
-  <p align="center">
-    Bot that plays Clash Royale and learns by playing games
-    <br />
-    <a href="https://github.com/krazyness/CRBot-public"><strong>Explore the docs »</strong></a>
-    <br />
-    <a href="https://github.com/krazyness/CRBot-public/issues/new?labels=bug&template=bug-report---.md">Report Bug</a>
-    &middot;
-    <a href="https://github.com/krazyness/CRBot-public/issues/new?labels=enhancement&template=feature-request---.md">Request Feature</a>
-  </p>
-</div>
+CRBot is a Windows-first automation and reinforcement-learning stack that teaches a Clash Royale agent to play directly against live opponents. The project captures the BlueStacks client, performs real-time vision with local Ultralytics models (no Roboflow dependency), and drives actions via PyAutoGUI while a DQN agent learns from dense rewards.
 
+---
 
+## Highlights
 
-<!-- TABLE OF CONTENTS -->
-<details>
-  <summary>Table of Contents</summary>
-  <ol>
-    <li>
-      <a href="#about-the-project">About The Project</a>
-      <ul>
-        <li><a href="#built-with">Built With</a></li>
-      </ul>
-    </li>
-    <li>
-      <a href="#getting-started">Getting Started</a>
-      <ul>
-        <li><a href="#prerequisites">Prerequisites</a></li>
-        <li><a href="#installation">Installation</a></li>
-      </ul>
-    </li>
-    <li><a href="#usage">Usage</a></li>
-    <li><a href="#contributing">Contributing</a></li>
-    <li><a href="#license">License</a></li>
-    <li><a href="#contact">Contact</a></li>
-    <li><a href="#acknowledgments">Acknowledgments</a></li>
-  </ol>
-</details>
+- **Local YOLO vision** – separate weights for arena (troops/towers) and card bar detection, shared between the bot and the standalone live-vision viewer.
+- **Integrated live HUD** – the training preview window mirrors the manual viewer and overlays detections, reward, tower state, last action, and match outcome.
+- **Reward system for real matches** – bonuses for destroying towers, defensive cleanup, and final win/loss signals inferred from the “WINNER” banner.
+- **Headless-friendly automations** – automatic match restarts, BlueStacks alignment, and a lightweight Flask status dashboard.
+- **Pluggable datasets** – drop in your own YOLO datasets/weights for cards or arena detections without touching the training loop.
 
+---
 
+## Repository Layout
 
-<!-- ABOUT THE PROJECT -->
-## About The Project
+```
+crbot/
+  automation/           # BlueStacks/pyautogui control layer
+  environment/          # ClashRoyaleEnv: RL-friendly wrapper + reward logic
+  reinforcement/        # DQN agent and replay buffer
+  training/             # Episode loop + status web server
+  vision/               # OCR utilities (winner screen, buttons)
+  ui/                   # Flask status page
+scripts/
+  train_bot.py          # CLI entry point for RL training
+  live_vision_viewer.py # Standalone vision debugger (same models as env)
+yolo_models/            # Checked-in base weights (cards.pt, etc.)
+documents/              # Reference material (reward design PDF)
+.gitignore              # Not tracked: datasets/, runs/, models/, logs/, screenshots/, debug/, .env
+```
 
-A Python-based Clash Royale AI bot that learns and improves through gameplay. This project aims to help others understand machine learning, reinforcement learning, and game automation in a practical context.
+> **Heads-up:** Anything listed in `.gitignore` stays local by design. That includes datasets, trained weights, runs, models, logs, debug screenshots, and your `.env`. Plan your own backup strategy for those folders.
 
-*(Disclaimer: This project is not affiliated with Supercell. Use at your own risk—automated gameplay may violate Clash Royale's Terms of Service.)*
+---
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+## Prerequisites
 
-### Built With
+- Windows 10/11 (BlueStacks automation is Windows-only)
+- Python 3.12 (with `pip`)
+- [BlueStacks Pie 64-bit](https://www.bluestacks.com/bluestacks-5.html) with Clash Royale installed
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (optional but recommended)
+- GPU support (CUDA) is helpful but not required; the YOLO models default to device 0
+- `pip install -r requirements.txt`
 
-* [![PyTorch][PyTorch.org]][PyTorch-url]
-* [![Docker][Docker.com]][Docker-url]
-* [![Roboflow][Roboflow.com]][Roboflow-url]
-* [![Python][Python.org]][Python-url]
+Optional:
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+- `mss` and OpenCV are already listed in requirements; ensure GPU drivers are up-to-date.
+- If you want the legacy Roboflow workflows, keep your `.env`, but the default build no longer depends on them.
 
-## Project Structure
+---
 
-- `crbot/` — Python package containing the environment, automation, training loop, and utilities.
-- `scripts/` — Command-line entry points such as `train_bot.py`, `match_reset.py`, and `live_vision_viewer.py`.
-- `assets/main_images/` — Reference images used by the automation layer.
-- `tests/` — Smoke tests and diagnostics.
-- `legacy/` — Archived snapshots of the previous implementation for reference.
+## Configuration Checklist
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-<!-- GETTING STARTED -->
-## Getting Started
-
-### Prerequisites
-
-* Windows (since that's the only OS it works on right now)
-* VSCode (unless you're more familiar with other code editors)
-* [Docker](https://www.docker.com/)
-* [Roboflow Account](https://www.roboflow.com/)
-* [BlueStacks](https://www.bluestacks.com/download.html)
-* [Python 3.12](https://www.python.org/downloads/windows/)
-* inference_sdk
-  ```
-  pip install inference-sdk
-  ```
-* PyTorch
-  ```
-  pip install torch
-  ```
-* PyAutoGUI
-  ```
-  pip install PyAutoGUI
-  ```
-* NumPy
-  ```
-  pip install numpy
-  ```
-  
-### Installation
-
-1. Create a Roboflow account as well as a workspace, then get your API key
-![roboflow-tutorial](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExNG1uNmtiaTAzamVvNnQwc2k3NDQzOXhzcmhxc2prZTBzM3U3YWY5YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/1KLeC2gw8pimdhH61C/giphy.gif)
-2. Clone the repo
-   ```sh
+1. **Clone the repository**
+   ```powershell
    git clone https://github.com/krazyness/CRBot-public.git
+   cd CRBot-public
    ```
-3. Set up your environment variables:
-   - Copy `.env.example` to `.env`
-   - Edit `.env` and replace `your_roboflow_api_key_here` with your actual Roboflow private API key
-   ```bash
-   # Copy the example file
-   cp .env.example .env
-   
-   # Edit .env and add your API key
-   ROBOFLOW_API_KEY=your_actual_api_key_here
+2. **Install dependencies**
+   ```powershell
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
    ```
-4. Fork both workflows:
-[Troop Detection](https://app.roboflow.com/workflows/embed/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ3b3JrZmxvd0lkIjoiTEx3TjlnOEduenBjWmVYSktKYzEiLCJ3b3Jrc3BhY2VJZCI6Ik5vVUlkM3gyYWRSU0tqaURrM0ZMTzlBSmE1bzEiLCJ1c2VySWQiOiJOb1VJZDN4MmFkUlNLamlEazNGTE85QUphNW8xIiwiaWF0IjoxNzUzODgxNTcyfQ.-ZO7pqc3mBX6W49-uThUSBLdUaCRzM9I8exfEu6-lo8)
-[Card Detection](https://app.roboflow.com/workflows/embed/eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ3b3JrZmxvd0lkIjoiMEFmeVpSQ3FSS1dhV1J5QTFGNkciLCJ3b3Jrc3BhY2VJZCI6InJtZHNiY2xlU292aEEwNm15UDFWIiwidXNlcklkIjoiTm9VSWQzeDJhZFJTS2ppRGszRkxPOUFKYTVvMSIsImlhdCI6MTc1Mzg4MjE4Mn0.ceYp4JZoNSIrDkrX2vuc9or3qVakNexseYEgacIrfLA)
+3. **Optional .env**
+   - Copy `.env.example` → `.env` if you still use Roboflow or other private keys.
+   - Otherwise the modern pipeline runs without any API keys.
+4. **Tesseract**
+   - Add `TESSERACT_EXE` to your environment if it is not in `PATH`.
+5. **BlueStacks setup**
+   - Create/launch a Pie 64-bit instance, install Clash Royale, position the window on the right edge, and ensure the title contains `pyclashbot-96` (default expected string).
 
-![Workspace-Fork-Tutorial](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExM2g4NTZ2MDlkM3JpdGl5emgxNHc3ejJudTRiMDFnbXFkNmxnNzgyeSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/94yt100mNmhRIPRu3d/giphy.gif)
+---
 
-5. Get the workspace names from your forked workflows and update your `.env` file:
-   - For the Troop Detection workspace, update `WORKSPACE_TROOP_DETECTION=your-troop-workspace-name`
-   - For the Card Detection workspace, update `WORKSPACE_CARD_DETECTION=your-card-workspace-name`
-   
-   Your `.env` file should look like:
-   ```bash
-   ROBOFLOW_API_KEY=your_actual_api_key_here
-   WORKSPACE_TROOP_DETECTION=workspace-your-troop-name
-   WORKSPACE_CARD_DETECTION=workspace-your-card-name
+## Vision Models & Datasets
+
+Two weight files drive all detection:
+
+| Purpose | Default Path | Source |
+|---------|--------------|--------|
+| Cards (deck bar) | `yolo_models/cards.pt` | Any YOLOv8/11 detection model trained on cropped card slots |
+| Arena (troops + towers) | `runs/arena/train_full_s1280/weights/best.pt` | YOLO detection model trained on the full battlefield |
+
+### Dataset Structure
+
+1. Place each dataset inside `datasets/` (this folder is ignored by git):
    ```
-6. Open Docker, and open the terminal on the bottom right, and install inference-cli (don't worry the terminal isn't stuck, it takes a long time)
-   ```js
-   pip install inference-cli
+   datasets/
+     cards_custom/
+       data.yaml
+       images/
+         train/
+         val/
+       labels/
+         train/
+         val/
+     arena_custom/
+       data.yaml
+       images/...
    ```
-7. Start the Inference Server
-   ```js
-   inference server start
+2. Author `data.yaml` like any YOLO dataset, e.g.:
+   ```yaml
+   path: datasets/arena_custom
+   train: images/train
+   val: images/val
+   names:
+     0: goblin
+     1: king-tower
+     ...
    ```
-8. Open http://localhost:9001/, and it should take you to the Roboflow Inference page.
-9. Open BlueStacks, and open the "multi-instance manager" (should be the third icon above the Discord icon, or its in the 3 dots), and create a fresh Pie 64-bit instance.
-10. Start the Pie 64-bit instance, open Google Play Store, and install Clash Royale.
-11. Optional: remove the ads on the left by opening settings (gear), > Preferences > Allow BlueStacks to show Ads during gameplay (disabled)
-12. Open Clash Royale, resize and position the window like so (stretched and to the right-most of the screen)
+   - For arena models, include tower classes (`king-tower`, `queen-tower`, etc.) so the reward logic can infer tower status.
+   - For cards, list every card name exactly as you want it to appear in telemetry.
 
-![BlueStacks-window-tutorial](https://media1.giphy.com/media/v1.Y2lkPTc5MGI3NjExM3k2enMwY3E4cHJ0MDhnbmg1NnhsaDI3bGhmazJ4aXlxczFkamFxeSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/y8yXKqwN40cdcr4yR5/giphy.gif)
+### Training New Weights
 
-13. Log in (or make a new) account on Clash Royale, click on battle, then run train.py, but immediately after, make sure the BlueStacks emulator is the front-most window.
+Use Ultralytics (already installed) to train in place:
 
-**NOTE:** The bot is broken right now, with it not handling "play again" correctly, as well as some minor bugs in gameplay. You can ask me any questions at the contacts page, or make contributions at the contributing page!
+```powershell
+# Arena example
+yolo detect train `
+  model=yolov8s.pt `
+  data=datasets/arena_custom/data.yaml `
+  imgsz=1280 `
+  epochs=80 `
+  batch=4 `
+  project=runs/arena `
+  name=train_full_s1280 `
+  cache=True `
+  device=0
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+# Cards example
+yolo detect train `
+  model=yolov8s.pt `
+  data=datasets/cards_custom/data.yaml `
+  imgsz=960 `
+  epochs=60 `
+  batch=8 `
+  project=runs/cards `
+  name=deck_v1
+```
 
+After training:
 
+1. Copy or point the bot to the `best.pt` you care about.
+   - Arena path is configured in `crbot/environment/game_env.py` via `ARENA_MODEL_PATH`.
+   - Cards path is `yolo_models/cards.pt`. Replace the file or update the constant.
+2. Optionally keep the `runs/` directory under version control in a separate repo; this project ignores it by default.
 
-<!-- USAGE EXAMPLES -->
-## Usage
+---
 
-![Demo](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExaXFtZmh1eG10amdidGhuMXBlb3dyaWZ3MjB5a2d6ZXluYXN6MTY0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/SFDKIvtoRL1Og4S7fn/giphy.gif)
+## Live Vision Viewer
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+Use the same models outside of training to verify detections:
 
+```powershell
+python scripts\live_vision_viewer.py
+```
 
+- Requires Clash Royale to be visible.
+- Press `Q` to exit.
+- The script annotates cards (green), troops (orange), and towers (cyan) exactly as the bot sees them, with the same class filters (`clock`, `elixir`, and UI text are suppressed).
 
-<!-- CONTRIBUTING -->
+---
+
+## Training the Bot
+
+1. Launch BlueStacks and queue into the main battle screen (no pop-ups).
+2. Run the trainer:
+   ```powershell
+   python scripts\train_bot.py --episodes 200 --batch-size 32
+   ```
+   Common flags:
+   - `--episodes N` – number of matches to play (default 10,000).
+   - `--batch-size B` – replay batch size (default 32).
+   - `--no-web` – disable the status page.
+   - `--web-host` / `--web-port` – bind address for the status dashboard (defaults to `127.0.0.1:5000`).
+3. Watch the integrated preview window (“CR Vision Tester”) for real-time overlays.
+4. Monitor `http://127.0.0.1:5000/` for aggregated stats (episode, epsilon, hand, tower OCR, etc.).
+
+### Outputs (Ignored by Git)
+
+- `logs/` – JSONL match summaries.
+- `models/` – DQN checkpoints (`model_*.pth` + `meta_*.json`).
+- `runs/` – YOLO training artifacts.
+- `screenshots/`, `debug/` – captured frames for OCR / troubleshooting.
+
+Make backups if you need to keep any of these artifacts.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `No compatible parameters found in checkpoint ...` | DQN architecture changed since the checkpoint was created | Delete/rename old files in `models/` or retrain to generate new weights |
+| Preview window blank | Clash Royale window title mismatch or BlueStacks minimized | Update `DEFAULT_GAME_TITLE` (in `crbot/utils/window.py`) or bring BlueStacks to foreground |
+| `ValueError: Coordinate 'right' is less than 'left'` in tower OCR | Mismatched detections vs. screenshot | Regenerate arena weights with tower classes, ensure BlueStacks resolution matches the default layout |
+| Live viewer shows ticks instead of detections | Wrong weights or missing files | Confirm `runs/arena/.../best.pt` and `yolo_models/cards.pt` exist; rerun YOLO training if not |
+| Tesseract errors | Missing installation | Install Tesseract and set `TESSERACT_EXE` |
+
+---
+
 ## Contributing
 
-Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
+1. Fork and create a feature branch (`git checkout -b feature/my-change`).
+2. Keep datasets, runs, and local checkpoints out of commits (they are ignored intentionally).
+3. Submit a pull request describing your change. When relevant, describe what datasets/weights you used so others can reproduce your setup.
 
-If you have a suggestion that would make this better, please fork the repo and create a pull request. You can also simply open an issue with the tag "enhancement".
-Don't forget to give the project a star! Thanks again!
+---
 
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+## License & Credits
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-
-
-<!-- LICENSE -->
-## License
-
-Distributed under the project_license. See `LICENSE.txt` for more information.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-
-
-<!-- CONTACT -->
-## Contact
-
-Brody Dai - itrytomakestuff99@gmail.com
-
-Project Link: [https://github.com/krazyness/CRBot-public](https://github.com/krazyness/CRBot-public)
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-
-
-<!-- ACKNOWLEDGMENTS -->
-## Acknowledgments
-
-* [Best README Template](https://github.com/othneildrew/Best-README-Template)
-* Mr. Foster, AP Computer Science teacher
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-
-
-<!-- MARKDOWN LINKS & IMAGES -->
-<!-- https://www.markdownguide.org/basic-syntax/#reference-style-links -->
-[PyTorch.org]: https://img.shields.io/badge/pytorch-green?style=for-the-badge&logo=pytorch&link=https%3A%2F%2Fpytorch.org%2F
-[PyTorch-url]: https://pytorch.org
-[Docker.com]: https://img.shields.io/badge/Docker-yellow?style=for-the-badge&logo=Docker&link=https%3A%2F%2Fwww.docker.com%2F
-[Docker-url]: https://www.docker.com/
-[Roboflow.com]: https://img.shields.io/badge/Roboflow-gray?style=for-the-badge&logo=roboflow&link=https%3A%2F%2Fwww.roboflow.com%2F
-[Roboflow-url]: https://www.roboflow.com/
-[Python.org]: https://img.shields.io/badge/Python-white?style=for-the-badge&logo=python&link=https%3A%2F%2Fwww.python.org%2F
-[Python-url]: https://www.python.org/
+CRBot is MIT-licensed. Clash Royale and associated assets belong to Supercell; use this project at your own risk and respect the game’s Terms of Service.
