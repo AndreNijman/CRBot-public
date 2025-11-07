@@ -68,15 +68,17 @@ PRINCESS_TOWER_REWARD = 50.0
 PRINCESS_TOWER_PENALTY = 50.0
 KING_TOWER_REWARD = 150.0
 KING_TOWER_PENALTY = 150.0
+TOWER_EVENT_COOLDOWN_MS = 1500
 DEFENSE_REWARD_PER_UNIT = 8.0
-WIN_REWARD = 300.0
-LOSS_PENALTY = -300.0
 
 ENV_DEBUG_DIR = str((DEBUG_DIR / "env").resolve())
 os.makedirs(ENV_DEBUG_DIR, exist_ok=True)
 
 def _nc(s):
     return s.strip().lower() if isinstance(s, str) else ""
+
+def _now_ms():
+    return int(time.time() * 1000)
 
 class ClashRoyaleEnv:
     def __init__(self):
@@ -119,6 +121,8 @@ class ClashRoyaleEnv:
         self._last_reward = 0.0
         self._tower_status = None
         self._tower_events = {}
+        self._tower_event_times = {"ally": {"king": None, "princess": None}, "enemy": {"king": None, "princess": None}}
+        self._tower_pending = {"ally": {"king": 0, "princess": 0}, "enemy": {"king": 0, "princess": 0}}
         self._current_enemy_troops = 0
         self._last_action_desc = "n/a"
         self._match_outcome = None
@@ -175,6 +179,8 @@ class ClashRoyaleEnv:
         self._last_reward = 0.0
         self._tower_status = None
         self._tower_events = {}
+        self._tower_event_times = {"ally": {"king": None, "princess": None}, "enemy": {"king": None, "princess": None}}
+        self._tower_pending = {"ally": {"king": 0, "princess": 0}, "enemy": {"king": 0, "princess": 0}}
         self._current_enemy_troops = 0
 
         self._schedule_next_emote()
@@ -443,18 +449,51 @@ class ClashRoyaleEnv:
             if king_scores[side]:
                 counts[side]["king"] = 1
             counts[side]["princess"] = min(2, len(princess_scores[side]))
-        if not record_events or self._tower_status is None:
+        if not record_events:
             self._tower_status = counts
-            if record_events:
-                self._tower_events = {}
+            return
+        if self._tower_status is None:
+            self._tower_status = counts
+            self._tower_events = {}
+            self._tower_event_times = {"ally": {"king": None, "princess": None}, "enemy": {"king": None, "princess": None}}
+            self._tower_pending = {"ally": {"king": 0, "princess": 0}, "enemy": {"king": 0, "princess": 0}}
             return
         prev = self._tower_status
+        now = _now_ms()
         events = {
-            "enemy_princess_destroyed": max(0, prev["enemy"]["princess"] - counts["enemy"]["princess"]),
-            "enemy_king_destroyed": max(0, prev["enemy"]["king"] - counts["enemy"]["king"]),
-            "ally_princess_lost": max(0, prev["ally"]["princess"] - counts["ally"]["princess"]),
-            "ally_king_lost": max(0, prev["ally"]["king"] - counts["ally"]["king"]),
+            "enemy_princess_destroyed": 0,
+            "enemy_king_destroyed": 0,
+            "ally_princess_lost": 0,
+            "ally_king_lost": 0,
         }
+
+        for side in ("ally", "enemy"):
+            for role in ("king", "princess"):
+                prev_count = prev[side][role]
+                new_count = counts[side][role]
+                pending = self._tower_pending[side][role]
+                last_change = self._tower_event_times[side][role]
+
+                if new_count < prev_count:
+                    self._tower_pending[side][role] = prev_count - new_count
+                    self._tower_event_times[side][role] = now
+                elif new_count > prev_count:
+                    self._tower_pending[side][role] = 0
+                    self._tower_event_times[side][role] = None
+                else:
+                    if pending > 0 and last_change is not None:
+                        if now - last_change >= TOWER_EVENT_COOLDOWN_MS:
+                            if side == "enemy" and role == "princess":
+                                events["enemy_princess_destroyed"] += pending
+                            elif side == "enemy" and role == "king":
+                                events["enemy_king_destroyed"] += pending
+                            elif side == "ally" and role == "princess":
+                                events["ally_princess_lost"] += pending
+                            elif side == "ally" and role == "king":
+                                events["ally_king_lost"] += pending
+                            self._tower_pending[side][role] = 0
+                            self._tower_event_times[side][role] = None
+
         self._tower_events = events
         self._tower_status = counts
 
@@ -680,13 +719,8 @@ class ClashRoyaleEnv:
         self._maybe_trigger_emote()
 
         if self.game_over_flag:
-            outcome = self.game_over_flag
             final_state = self._get_state()
             reward = self._compute_reward(final_state)
-            if outcome == "victory":
-                reward += WIN_REWARD
-            else:
-                reward += LOSS_PENALTY
             self.match_over_detected = False
             return final_state, reward, True
 
