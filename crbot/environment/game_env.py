@@ -763,11 +763,13 @@ class ClashRoyaleEnv:
 
     # ---------------- State construction ----------------
     def _get_state(self):
-        try:
-            elixir = self.actions.count_elixir()
-        except Exception:
-            elixir = None
-        self._last_elixir = int(elixir) if isinstance(elixir, (int, float)) else None
+        # TODO: Re-enable elixir detection once the vision pipeline is reliable.
+        # try:
+        #     elixir = self.actions.count_elixir()
+        # except Exception:
+        #     elixir = None
+        # self._last_elixir = int(elixir) if isinstance(elixir, (int, float)) else None
+        self._last_elixir = None
         detections, img_size = self._capture_and_process_scene(record_events=True)
         return self._build_state_from_detections(detections, img_size)
 
