@@ -11,8 +11,7 @@ TITLE_SUBSTR = "pyclashbot-96"
 
 MODEL_DIR = "yolo_models"
 CARDS_PT  = f"{MODEL_DIR}/cards.pt"
-TROOPS_PT = f"{MODEL_DIR}/troops.pt"
-TOWERS_PT = f"{MODEL_DIR}/towers.pt"
+ARENA_COMBINED_PT = "runs/arena/train_full_s1280/weights/best.pt"
 
 # Tunables
 CONF_CARDS, CONF_TROOPS, CONF_TOWERS = 0.25, 0.22, 0.22
@@ -20,9 +19,10 @@ IMGSZ_CARDS, IMGSZ_ARENA = 960, 960   # bigger = better for small targets
 DECK_HEIGHT_FRACTION = 0.24           # bottom % of the window for cards ROI
 WINDOW_NAME = "CR Vision Tester"
 
-cards_model  = YOLO(CARDS_PT)
-troops_model = YOLO(TROOPS_PT)
-towers_model = YOLO(TOWERS_PT)
+cards_model = YOLO(CARDS_PT)
+# Combined arena model now covers both troops and towers detections.
+troops_model = YOLO(ARENA_COMBINED_PT)
+towers_model = troops_model
 
 def _find_window_rect(title_substr: str):
     target = {"hwnd": None}
