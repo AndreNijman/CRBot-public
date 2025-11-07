@@ -56,7 +56,7 @@ Optional:
 
 1. **Clone the repository**
    ```powershell
-   git clone https://github.com/krazyness/CRBot-public.git
+   git clone https://github.com/AndreNijman/CRBot-public.git
    cd CRBot-public
    ```
 2. **Install dependencies**
